@@ -1,0 +1,24 @@
+[project]
+name = "esp32-audio"
+version = "0.1.0"
+description = "Audio processing with ESP32"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "groq>=1.4.0",
+    "openai>=2.38.0",
+    "packaging>=26.2",
+    "scipy>=1.17.1",
+    "sounddevice>=0.5.5",
+    "torch>=2.12.0",
+    "torchaudio>=2.11.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
