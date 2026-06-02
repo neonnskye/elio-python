@@ -1,7 +1,7 @@
 [project]
-name = "esp32-audio"
+name = "elio-python"
 version = "0.1.0"
-description = "Audio processing with ESP32"
+description = "Elio Python backend"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
