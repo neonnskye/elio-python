@@ -7,7 +7,9 @@ requires-python = ">=3.13"
 dependencies = [
     "groq>=1.4.0",
     "openai>=2.38.0",
+    "opencv-python>=4.13.0.92",
     "packaging>=26.2",
+    "requests>=2.34.2",
     "scipy>=1.17.1",
     "sounddevice>=0.5.5",
     "torch>=2.12.0",
