@@ -173,6 +173,10 @@ BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
 )
 
+CTRL_WAKE_LED_ON = 0x01
+CTRL_PROCESSING_ON = 0x02
+CTRL_STOP_ALL = 0x03
+
 listen_state = ListenState.IDLE
 bleed_remaining = 0
 state_lock = threading.Lock()
@@ -237,7 +241,7 @@ def control_listener() -> None:
             data, addr = ctrl_sock.recvfrom(16)
         except socket.timeout:
             continue
-        if not data or data[0] != 0x01:
+        if not data or data[0] != CTRL_WAKE_LED_ON:
             continue
 
         now = time.monotonic()
@@ -339,11 +343,7 @@ def vad_accumulator_loop() -> None:
                 print(
                     f"\n{ts()} [VAD] No speech detected for {CAPTURE_TIMEOUT_S}s — false positive, resetting to IDLE"
                 )
-                with state_lock:
-                    listen_state = ListenState.IDLE
-                accumulator = []
-                silence_packets = 0
-                vad_model.reset_states()
+                reset_to_idle("no speech after wake word")
                 continue
 
         if is_speech:
@@ -371,18 +371,13 @@ def vad_accumulator_loop() -> None:
                     # 0x03 doubles as chime-stop; at this point the chime loop
                     # hasn't started yet (0x02 fires after), so on the ESP32 side
                     # this only has the LED effect.
-                    audio_send_sock.sendto(
-                        bytes([0x03]), (ESP32_IP, ESP32_CTRL_TX_PORT)
-                    )
-                    audio_send_sock.sendto(
-                        bytes([0x02]), (ESP32_IP, ESP32_CTRL_TX_PORT)
-                    )
+                    send_chime_stop()
+                    send_ctrl(CTRL_PROCESSING_ON, repeat=3)
                 else:
                     print(
                         f"\n{ts()} [VAD] Segment too short ({len(accumulator)} pkts), discarding"
                     )
-                    with state_lock:
-                        listen_state = ListenState.IDLE
+                    reset_to_idle("speech segment too short")
                 accumulator = []
                 silence_packets = 0
                 vad_model.reset_states()  # reset internal LSTM state — session done
@@ -451,16 +446,12 @@ def transcription_loop() -> None:
                 f"{ts()} [transcribe] TIMEOUT after {STT_TIMEOUT_S}s — resetting to IDLE",
                 flush=True,
             )
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("STT timeout")
             continue
 
         if "error" in result_holder:
             print(f"{ts()} [transcribe error] {result_holder['error']}", flush=True)
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("STT error")
             continue
 
         text = result_holder.get("text", "").strip()
@@ -471,20 +462,13 @@ def transcription_loop() -> None:
                 print(
                     f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
                 )
-                send_chime_stop()
-                with state_lock:
-                    listen_state = ListenState.IDLE
+                reset_to_idle("transcript too short")
             else:
                 with state_lock:
                     listen_state = ListenState.RESPONDING
                 llm_queue.put(text)
         else:
-            with state_lock:
-                listen_state = ListenState.IDLE
-
-        with state_lock:
-            if listen_state != ListenState.RESPONDING:
-                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("empty transcript")
 
 
 def strip_markdown(text: str) -> str:
@@ -611,9 +595,7 @@ def llm_loop() -> None:
                         and conversation_history[-1]["role"] == "user"
                     ):
                         conversation_history.pop()
-                with state_lock:
-                    listen_state = ListenState.IDLE
-                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+                reset_to_idle("LLM timeout")
                 continue
 
             # Flush any remaining text in the buffer as a final sentence
@@ -654,9 +636,7 @@ def llm_loop() -> None:
                     conversation_history.pop()
         finally:
             if not tts_queued:
-                with state_lock:
-                    listen_state = ListenState.IDLE
-                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+                reset_to_idle("no TTS queued")
 
 
 def wav_bytes_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
@@ -693,15 +673,58 @@ def send_audio_esp32(pcm_int16: np.ndarray) -> None:
         # If remaining < 0, we're behind — skip sleep, catch up immediately
 
 
+def send_ctrl(byte_value: int, repeat: int = 3) -> None:
+    """
+    Send a control byte to ESP32.
+    UDP can drop packets, so important control commands are sent more than once.
+    """
+    try:
+        for _ in range(repeat):
+            audio_send_sock.sendto(bytes([byte_value]), (ESP32_IP, ESP32_CTRL_TX_PORT))
+            time.sleep(0.02)
+    except Exception as exc:
+        print(f"{ts()} [CTRL] Failed to send byte {byte_value}: {exc}", flush=True)
+
+
 def send_chime_stop() -> None:
-    """Tell the ESP32 to stop the latency chime loop.
+    """Tell the ESP32 to stop the latency chime loop and turn off the LED.
     Called on any pipeline path that resets to IDLE without sending TTS audio.
     The ESP32 handles 0x03 as an immediate chime-loop stop signal.
     """
-    try:
-        audio_send_sock.sendto(bytes([0x03]), (ESP32_IP, ESP32_CTRL_TX_PORT))
-    except Exception as exc:
-        print(f"{ts()} [CTRL] Failed to send chime stop: {exc}", flush=True)
+    send_ctrl(CTRL_STOP_ALL, repeat=3)
+
+
+def reset_to_idle(reason: str = "") -> None:
+    """
+    Reset Python state and always tell ESP32 to turn off LED/chime.
+    This is the main fix for the bug where the blue LED stays permanently ON
+    after a false positive wake word or any non-speech pipeline abort.
+    """
+    global listen_state, accumulator, silence_packets, is_responding, leftover
+
+    send_chime_stop()
+
+    with queue_lock:
+        is_responding = False
+        response_queue.clear()
+        leftover = np.zeros(0, dtype=np.float32)
+
+    accumulator = []
+    silence_packets = 0
+
+    if vad_model is not None:
+        try:
+            vad_model.reset_states()
+        except Exception:
+            pass
+
+    with state_lock:
+        listen_state = ListenState.IDLE
+
+    if reason:
+        print(f"{ts()} [STATE] Reset to IDLE: {reason}")
+    else:
+        print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
 def play_audio_local(pcm_int16: np.ndarray) -> None:
@@ -721,19 +744,21 @@ def play_audio_local(pcm_int16: np.ndarray) -> None:
 
 
 def play_audio(pcm_int16: np.ndarray) -> None:
-    """Route int16 PCM audio to the configured output(s)."""
-    global listen_state
-    if AUDIO_OUTPUT == "local":
-        play_audio_local(pcm_int16)
-    elif AUDIO_OUTPUT == "esp32":
-        send_audio_esp32(pcm_int16)
-        with state_lock:
-            listen_state = ListenState.IDLE
-        print(f"{ts()} [STATE] Ready. Waiting for wake word...")
-    elif AUDIO_OUTPUT == "both":
-        # Local playback is non-blocking (just queues), so run it first
-        play_audio_local(pcm_int16)
-        send_audio_esp32(pcm_int16)
+    """Route int16 PCM audio to the configured output(s).
+    After ESP32 playback finishes, always send 0x03 to turn off the blue LED.
+    """
+    try:
+        if AUDIO_OUTPUT == "local":
+            play_audio_local(pcm_int16)
+        elif AUDIO_OUTPUT == "esp32":
+            send_audio_esp32(pcm_int16)
+        elif AUDIO_OUTPUT == "both":
+            # Local playback is non-blocking (just queues), so run it first
+            play_audio_local(pcm_int16)
+            send_audio_esp32(pcm_int16)
+    finally:
+        if AUDIO_OUTPUT in ("esp32", "both"):
+            reset_to_idle("ESP32 playback finished")
 
 
 def audio_dispatch_loop() -> None:
@@ -799,24 +824,12 @@ def tts_loop() -> None:
                 f"{ts()} [TTS] TIMEOUT after {TTS_TIMEOUT_S}s — resetting to IDLE",
                 flush=True,
             )
-            send_chime_stop()
-            with queue_lock:
-                is_responding = False
-                response_queue.clear()
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("TTS timeout")
             continue
 
         if "error" in result_holder:
             print(f"{ts()} [TTS error] {result_holder['error']}", flush=True)
-            send_chime_stop()
-            with queue_lock:
-                is_responding = False
-                response_queue.clear()
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("TTS error")
             continue
 
         try:
@@ -853,12 +866,7 @@ def tts_loop() -> None:
 
         except Exception as exc:
             print(f"{ts()} [TTS error] (post-synthesis) {exc}", flush=True)
-            with queue_lock:
-                is_responding = False
-                response_queue.clear()
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            reset_to_idle("TTS post-synthesis error")
 
 
 def receive_loop(sock: socket.socket) -> None:
@@ -1073,6 +1081,9 @@ def main() -> None:
             print(f"\n{ts()} Shutting down...")
 
         shutdown_event.set()
+
+        # Tell ESP32 to turn off LED / stop chime
+        send_chime_stop()
 
         # Unblock any thread stuck on queue.get() with sentinel values
         llm_queue.put(None)
