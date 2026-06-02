@@ -2,81 +2,88 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build & Flash Commands
+## Commands
 
-All commands run via PlatformIO CLI or the PlatformIO IDE extension.
+All Python commands use `uv` (managed in [pyproject.toml](pyproject.toml)).
 
 ```bash
-# Build
-pio run
+# Install dependencies
+uv sync
 
-# Build and upload to device
-pio run --target upload
+# Run the receiver
+uv run receiver.py
 
-# Monitor serial output (115200 baud)
-pio device monitor
+# Check OpenRouter connectivity
+uv run tools/check_openrouter.py
 
-# Build, upload, and monitor in one step
-pio run --target upload && pio device monitor
+# Verify PyTorch installation
+uv run tools/check_torch.py
 
-# Clean build artifacts
-pio run --target clean
+# Convert WAV to C header (for ESP32 chime data)
+uv run tools/wav_to_header.py input.wav output.h var_name --rate 16000
 ```
 
 ## Project Overview
 
-ESP32 audio project targeting the **NodeMCU-32S** board using the Arduino framework via PlatformIO.
-The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi UDP to a Python backend for playback and processing.
+Python backend for the **Elio** voice assistant. Receives real-time audio from an ESP32 over Wi-Fi UDP,
+runs Silero VAD, Groq STT, and streams LLM responses through TTS playback over I2S.
+Firmware source (ESP32 Arduino, board: NodeMCU-32S) lives in a separate repository.
 
-- **Target board:** `nodemcu-32s` (Espressif ESP32)
-- **Framework:** Arduino
-- **Serial baud rate:** 115200
-- **Dependencies:** built-in Arduino ESP32 framework (`WiFi.h`, `WiFiUDP.h`), ESP-IDF headers (`driver/adc.h`, `driver/i2s.h`, `esp_wifi.h`), and `lib/Elio_Wake_v3_inferencing` (Edge Impulse wake-word model)
-- **Python:** requires >= 3.12; managed with `uv`
+- **Python:** requires >= 3.13; managed with `uv`
+- **Dependencies:** `groq`, `openai`, `scipy`, `sounddevice`, `torch` (CPU via pytorch-cpu index), `torchaudio`
+- **Runtime deps:** two API keys (`GROQ_API_KEY`, `OPENROUTER_API_KEY`) — set as environment variables
 
-## Hardware
+## Hardware Context
 
-- **Microphone:** MAX9814 analog electret mic amplifier
-- **ADC pin:** GPIO 35 (ADC1 channel 7, input-only)
-- **ADC config:** 12-bit resolution, 12 dB attenuation (`ADC_ATTEN_DB_12`, full 0–3.3 V range)
-- **Sample rate:** 16 000 Hz
+This repo is the **Python backend** — firmware source lives elsewhere. Key context for understanding the audio pipeline:
+
+- **Sample rate:** 16 000 Hz (must match ESP32 firmware)
+- **Input format:** 512 uint16 samples per UDP packet on port 12345
+- **Output to ESP32:** int16 PCM mono UDP on port 12347, paced to real-time
+- **Control to ESP32:** `0x01` (wake trigger), `0x02` (start chime), `0x03` (stop chime) on port 12348/12346
 
 ## Code Structure
 
-- [src/main.cpp](src/main.cpp) — single entry point; Arduino `setup()` and `loop()`
-- [platformio.ini](platformio.ini) — board, platform, and framework config
-- [receiver.py](receiver.py) — Python UDP receiver and real-time audio playback
+- [receiver.py](receiver.py) — entry point; multi-threaded UDP receiver with VAD/STT/LLM/TTS pipeline
 - [pyproject.toml](pyproject.toml) — Python project config (managed with `uv`)
-- [lib/](lib/) — local libraries; `Elio_Wake_v3_inferencing` (Edge Impulse wake-word model) and `README` (audio chime data)
-- [include/](include/) — shared headers; contains `jbl_begin.h` (begin chime WAV data), `jbl_latency.h` (latency chime WAV data)
-- `.pio/` — generated build artifacts and downloaded lib dependencies (not edited manually)
+- [tools/](tools/) — utility scripts for development (see below)
 - `.venv/` — Python virtual environment (managed by `uv`, not edited manually)
 
-## Current Functionality
+### Utilities (`tools/`)
 
-The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer ISR and streams raw ADC samples to a PC over **Wi-Fi UDP**.
+| Script | Purpose |
+|--------|---------|
+| [wav_to_header.py](tools/wav_to_header.py) | Convert WAV files to C headers (for ESP32 chime data) |
+| [check_openrouter.py](tools/check_openrouter.py) | Quick connectivity test for OpenRouter API |
+| [check_torch.py](tools/check_torch.py) | Verify PyTorch/CUDA installation |
+| [data_prep.sh](tools/data_prep.sh) | Shell script for audio dataset preparation |
 
-### Architecture
+## Audio Pipeline
 
-- **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of the UDP double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
-- **Edge Impulse inference buffer** — same ISR also feeds samples (converted to `int16_t` and upscaled by 16) into a second double buffer managed by `ei_inference_t`. When a slice is full, the ISR sends a FreeRTOS task notification (`vTaskNotifyGiveFromISR`) to wake the inference task.
-- **`inferenceTask`** (pinned to core 0) — blocks on `ulTaskNotifyTake` until the ISR signals a slice is ready, then calls `run_classifier_continuous()` and prints per-label scores. When the `"elio"` label exceeds `0.6`, it lights `LED_BUILTIN` for 500 ms and sends a single-byte trigger packet (`0x01`) to the Python receiver via `CTRL_UDP_PORT`.
-- **`loop()`** (core 1) — when a UDP buffer is flagged ready, sends the 1024-byte payload as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Core 1 also hosts the WiFi/UDP stack; splitting inference to core 0 prevents EI processing from delaying packet transmission.
-- **Double buffer** — decouples sampling from sending so the ISR never stalls waiting for UDP transmission.
-- **`esp_wifi_set_ps(WIFI_PS_NONE)`** — disables WiFi modem sleep to reduce RF interference on the ADC.
-- **I2S audio output** — `setup()` initializes I2S in master TX mode (16-bit, 16 kHz stereo) with DMA buffers. Pins: `BCK=26`, `WS=25`, `DATA=22` — drives a MAX98357 I2S amplifier. Mono samples are duplicated to both stereo channels.
-- **`audioPlaybackTask`** (core 1) — listens on `AUDIO_RX_PORT` (12347) for TTS audio UDP packets from the PC. Maintains a 3-packet jitter buffer (~96 ms) before starting playback. Each received packet (int16 mono) is scaled by `PLAYBACK_VOLUME_PCT`, duplicated to stereo, and written to I2S. A 200 ms silence timeout resets the playback state and signals `isSpeaking = false`.
-- **`ctrlListenTask`** (core 1) — listens on `ESP32_CTRL_RX_PORT` (12348) for control bytes from the PC:
-  - `0x02` ("transcribing") — starts the looping latency chime (`chimeLoopTask`, plays `jbl_latency.h` in a loop on core 1) to fill the STT/LLM gap with pleasant audio
-  - `0x03` ("stop") — stops the latency chime immediately and zeros the I2S DMA buffer
-- **`playChime()`** — plays a WAV chunk (`jbl_begin.h` or `jbl_latency.h`) over I2S. Used for wake-word confirmation (begin chime) and STT/LLM gap fill (latency chime loop). Volume controlled by `CHIME_VOLUME_PCT`.
-- **`isSpeaking` gate** — the `inferenceTask` suppresses wake-word trigger packets when `isSpeaking == true` to prevent acoustic feedback (the ESP32's own speaker audio re-entering the microphone).
+This repo implements a multi-threaded voice pipeline that runs on the PC (see [receiver.py](receiver.py) for all thread definitions):
 
-### UDP Packet Format
+```
+ESP32 mic → UDP (port 12345) → receive_loop → [packet_queue → local speaker (passthrough)]
+                                              → [vad_queue → VAD → STT → LLM → TTS → speaker output]
+                                                                                        ↓
+                                                                       ESP32 I2S or local sounddevice
+```
 
-Each packet is exactly **1024 bytes**: 512 little-endian `uint16_t` samples representing raw 12-bit ADC values (0–4095). The receiver subtracts 2048 (DC midpoint) and normalises to float before playback.
+### Pipeline Threads (7 daemon threads)
 
-### Wake Word Control Channel
+| Thread | Purpose | Key Config |
+|--------|---------|------------|
+| `receive_loop` | Receive UDP audio, decode uint16→float32, push to dual queues | `UDP_PORT`, `SAMPLES_PER_PKT` |
+| `control_listener` | Listen on `CTRL_PORT` (12346) for wake word (`0x01`) from ESP32 | `CTRL_PORT`, `WAKE_COOLDOWN_S` |
+| `vad_accumulator_loop` | Run Silero VAD on audio, build speech segments | `SILERO_VAD_THRESHOLD`, `CAPTURE_TIMEOUT_S` |
+| `transcription_loop` | Groq STT on completed segments | `GROQ_MODEL`, `STT_TIMEOUT_S` |
+| `llm_loop` | Stream LLM response via OpenRouter, split sentences | `LLM_MODEL`, `LLM_SYSTEM_PROMPT` (in code) |
+| `tts_loop` | OpenRouter TTS, resample 24→16 kHz, queue for dispatch | `TTS_MODEL`, `TTS_VOICE` |
+| `audio_dispatch_loop` | Drain TTS audio to ESP32 UDP or local sounddevice | `AUDIO_OUTPUT`, `ESP32_IP` |
+
+### Wake Word State Machine
+
+The `ListenState` enum (in Python) drives the entire pipeline:
 
 When the Edge Impulse classifier detects the wake word (label `"elio"` > 0.6), the ESP32 sends a 1-byte UDP packet (`0x01`) to `CTRL_UDP_PORT` on the PC. The Python receiver's `control_listener` thread picks this up and drives a `ListenState` state machine:
 
@@ -94,20 +101,13 @@ When entering `CAPTURING`, the PC sends `0x02` to ESP32 to start a looping laten
 
 A `CAPTURE_TIMEOUT_S` (3 s) timer starts when entering `CAPTURING`; if no speech is detected by **Silero VAD** within that window, the state resets to `IDLE` (false-positive guard).
 
-### Configuration (`src/main.cpp` defines)
+### ESP32 ↔ PC Contract
 
-| Define | Default | Description |
-|--------|---------|-------------|
-| `WIFI_SSID` | — | Wi-Fi network name |
-| `WIFI_PASSWORD` | — | Wi-Fi password |
-| `PC_IP` | — | Receiver's IPv4 address (run `ipconfig` on Windows) |
-| `UDP_PORT` | `12345` | UDP port for audio stream (must match Python receiver) |
-| `CTRL_UDP_PORT` | `12346` | UDP port for wake word trigger signal (must match Python `CTRL_PORT`) |
-| `AUDIO_RX_PORT` | `12347` | UDP port for receiving TTS audio from PC |
-| `ESP32_CTRL_RX_PORT` | `12348` | UDP port for PC → ESP32 control bytes (`0x02` start chime, `0x03` stop chime) |
-| `PLAYBACK_VOLUME_PCT` | `95` | Volume scale applied to incoming TTS samples (out of 100) |
-| `CHIME_VOLUME_PCT` | `95` | Volume scale applied to chime samples (out of 100) |
-| `SAMPLES_PER_PKT` | `512` | Samples per UDP packet |
+The ESP32 firmware (separate repo) sends UDP audio at 16 kHz, 512 uint16 samples per packet on port 12345.
+Control packets flow on port 12346 (ESP32→PC: `0x01` = wake word) and port 12348 (PC→ESP32: `0x02` = start chime, `0x03` = stop chime).
+TTS audio is sent back to the ESP32 on port 12347 as int16 PCM mono.
+
+See the [Python config table below](#python-configuration-receiverpy-constants) for port/address constants.
 
 ### Python Backend
 
@@ -137,6 +137,7 @@ On startup, a background warmup thread primes the DeepSeek KV cache with a dummy
 | `MAX_QUEUE_LEN` | `10` | Max queued packets before dropping oldest (~320 ms) |
 | `NOISE_GATE` | `0` | RMS threshold below which a packet is silenced (0 = off) |
 | `SILERO_VAD_THRESHOLD` | `0.5` | Silero VAD speech probability threshold |
+| `RECORDING_MODE` | `False` | Set True for dataset collection passthrough (disables all pipeline threads, mic→speaker only) |
 | `AUDIO_OUTPUT` | `"esp32"` | Audio routing: `"local"`, `"esp32"`, or `"both"` |
 | `ESP32_IP` | — | ESP32's IP address for TTS audio UDP |
 | `GROQ_MODEL` | `"whisper-large-v3"` | Groq STT model for transcription |
@@ -187,17 +188,14 @@ ESP32 streams live diagnostic counts to serial: `Sent: N | Failed: N`. A rising 
 
 ## Troubleshooting
 
-### `endPacket(): could not send data: 12`
-Error 12 is `ENOMEM` in lwIP — the UDP send buffer was temporarily unavailable. Root cause was a race where `readyBuf` was marked consumed *before* `endPacket()` was called, so a failed send silently dropped audio data. The fix in `loop()` retries until send succeeds.
-
 ### Python receiver stays at "Waiting for N packets to pre-buffer..."
 1. Verify ESP32 and PC are on the same subnet (ESP32 streams to `PC_IP`, not broadcast)
 2. Check firewall allows UDP port 12345 inbound
-3. Confirm `PC_IP` in `src/main.cpp` matches the machine running `receiver.py`
-4. ESP32 shows `Sent:` and `Failed:` counters — `Failed` incrementing indicates send errors
+3. Confirm `PC_IP` in the ESP32 firmware matches the machine running `receiver.py`
+4. ESP32 firmware shows `Sent:` and `Failed:` counters on serial — `Failed` incrementing indicates send errors
 
-### Serial Output During Streaming
-ESP32 prints live counts: `Sent: N | Failed: N`. If `Failed` keeps growing, check network path to receiver.
-
-### PlatformIO Serial Config
-`platformio.ini` sets `monitor_dtr = 0` and `monitor_rts = 0` to prevent the ESP32 from resetting when the serial monitor connects.
+### Receiver boots but no audio / errors
+- Confirm both `GROQ_API_KEY` and `OPENROUTER_API_KEY` are set before running
+- Verify `ESP32_IP` in [receiver.py](receiver.py) matches the ESP32's boot-printed IP
+- Check `AUDIO_OUTPUT` is set to `"local"` if no ESP32 is available for testing
+- Set `RECORDING_MODE = True` to test mic-to-speaker passthrough without any API calls
