@@ -16,6 +16,11 @@ import numpy as np
 import scipy.signal
 import sounddevice as sd
 import torch
+
+# Sentinel pushed onto tts_queue after all sentences from one LLM turn are queued.
+# tts_loop forwards it to audio_queue as None, which audio_dispatch_loop uses to
+# call reset_to_idle exactly once per turn instead of once per sentence.
+TTS_TURN_DONE = object()
 from groq import Groq
 from openai import OpenAI
 
@@ -607,6 +612,11 @@ def llm_loop() -> None:
                     tts_queue.put(clean)
                     tts_queued = True
 
+            # Signal end of this LLM turn to the TTS pipeline so reset_to_idle
+            # fires exactly once, not once per sentence.
+            if tts_queued:
+                tts_queue.put(TTS_TURN_DONE)
+
             # Log the full response for debugging
             sanitized = strip_markdown(collected)
             if sanitized != collected:
@@ -747,27 +757,22 @@ def play_audio_local(pcm_int16: np.ndarray) -> None:
 
 
 def play_audio(pcm_int16: np.ndarray) -> None:
-    """Route int16 PCM audio to the configured output(s).
-    After ESP32 playback finishes, always send 0x03 to turn off the blue LED.
-    """
-    try:
-        if AUDIO_OUTPUT == "local":
-            play_audio_local(pcm_int16)
-        elif AUDIO_OUTPUT == "esp32":
-            send_audio_esp32(pcm_int16)
-        elif AUDIO_OUTPUT == "both":
-            # Local playback is non-blocking (just queues), so run it first
-            play_audio_local(pcm_int16)
-            send_audio_esp32(pcm_int16)
-    finally:
-        if AUDIO_OUTPUT in ("esp32", "both"):
-            reset_to_idle("ESP32 playback finished")
+    """Route int16 PCM audio to the configured output(s)."""
+    if AUDIO_OUTPUT == "local":
+        play_audio_local(pcm_int16)
+    elif AUDIO_OUTPUT == "esp32":
+        send_audio_esp32(pcm_int16)
+    elif AUDIO_OUTPUT == "both":
+        # Local playback is non-blocking (just queues), so run it first
+        play_audio_local(pcm_int16)
+        send_audio_esp32(pcm_int16)
 
 
 def audio_dispatch_loop() -> None:
     """Drain audio_queue and dispatch each sentence for playback.
     Runs in its own daemon thread, decoupled from TTS synthesis so the
     next sentence can be synthesised while the current one plays.
+    Uses a None sentinel to call reset_to_idle exactly once per LLM turn.
     """
     while not shutdown_event.is_set():
         audio_queue_event.wait(timeout=0.1)
@@ -775,8 +780,12 @@ def audio_dispatch_loop() -> None:
             with audio_queue_lock:
                 if not audio_queue:
                     break
-                pcm_int16 = audio_queue.popleft()
-            play_audio(pcm_int16)
+                item = audio_queue.popleft()
+            if item is None:
+                # End-of-turn sentinel — reset state once, not once per sentence
+                reset_to_idle("ESP32 playback finished")
+            else:
+                play_audio(item)
         audio_queue_event.clear()
 
 
@@ -795,6 +804,12 @@ def tts_loop() -> None:
             continue
         if text is None:
             break
+        if text is TTS_TURN_DONE:
+            # End of one LLM turn — forward None as end-of-turn sentinel to audio dispatch
+            with audio_queue_lock:
+                audio_queue.append(None)
+            audio_queue_event.set()
+            continue
         result_holder = {}
 
         def do_tts():

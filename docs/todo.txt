@@ -1,5 +1,4 @@
 [audio]
 identify latency issues
 try local llm / stt / tts
-fix multiple logging bug
 switch to mqtt
