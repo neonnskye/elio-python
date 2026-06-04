@@ -1,4 +1,7 @@
 [audio]
 identify latency issues
+    run kokoro TTS locally (avoid network roundtrips)
+    true streaming (stream LLM and TTS on the fly per sentence)
+    local LLM or hit deepseek API directly
 try local llm / stt / tts
 switch to mqtt
