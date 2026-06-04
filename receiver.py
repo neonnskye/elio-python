@@ -1,3 +1,4 @@
+# pip install paho-mqtt
 import collections
 import io
 import os
@@ -13,6 +14,7 @@ from enum import Enum, auto
 from math import gcd
 
 import numpy as np
+import paho.mqtt.client as mqtt
 import scipy.signal
 import sounddevice as sd
 import torch
@@ -62,7 +64,6 @@ RECORDING_MODE = False
 AUDIO_OUTPUT = "esp32"  # "local" | "esp32" | "both"
 ESP32_IP = "172.20.10.3"  # must match IP printed by ESP32 on boot — adjust if different
 ESP32_AUDIO_PORT = 12347
-ESP32_CTRL_TX_PORT = 12348  # ESP32 listens here for PC → ESP32 control bytes
 AUDIO_SEND_CHUNK = 512  # samples per UDP packet
 AUDIO_SEND_RATE = 16000  # Hz
 AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pacing
@@ -173,14 +174,14 @@ CONVERSATION_HISTORY_MAX_TURNS = (
 )
 
 # Wake word gating
-CTRL_PORT = 12346
+MQTT_BROKER = "172.20.10.5"  # change to broker IP if not running locally
+MQTT_PORT = 1883
+TOPIC_WAKE = "elio/wake"
+TOPIC_CTRL = "elio/ctrl"
+
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
 )
-
-CTRL_WAKE_LED_ON = 0x01
-CTRL_PROCESSING_ON = 0x02
-CTRL_STOP_ALL = 0x03
 
 listen_state = ListenState.IDLE
 bleed_remaining = 0
@@ -215,6 +216,8 @@ history_lock = threading.Lock()
 # UDP socket for sending TTS audio to ESP32
 audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+mqtt_client = mqtt.Client(client_id="elio-receiver")
+
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
 silence_packets = 0
@@ -223,49 +226,6 @@ MIN_SPEECH_PACKETS = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 
 vad_model = None
-
-
-def control_listener() -> None:
-    """Listens on CTRL_PORT for wake word trigger packets from the ESP32."""
-    global listen_state, bleed_remaining
-
-    if RECORDING_MODE:
-        print(f"{ts()} [RECORDING MODE] control_listener disabled.")
-        return
-
-    last_wake_time = 0.0
-    WAKE_COOLDOWN_S = 1.5
-
-    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ctrl_sock.bind(("0.0.0.0", CTRL_PORT))
-    ctrl_sock.settimeout(1.0)
-    print(f"{ts()} Control listener ready on port {CTRL_PORT}")
-
-    while not shutdown_event.is_set():
-        try:
-            data, addr = ctrl_sock.recvfrom(16)
-        except socket.timeout:
-            continue
-        if not data or data[0] != CTRL_WAKE_LED_ON:
-            continue
-
-        now = time.monotonic()
-        if now - last_wake_time < WAKE_COOLDOWN_S:
-            continue
-        last_wake_time = now
-
-        with state_lock:
-            if listen_state != ListenState.IDLE:
-                print(
-                    f"{ts()} [CTRL] Wake signal received but state is {listen_state.name}, ignoring."
-                )
-                continue
-            listen_state = ListenState.SKIP_WAKEWORD_BLEED
-            bleed_remaining = BLEED_SKIP_PACKETS
-
-        print(
-            f"\n{ts()} [WAKE] Wake word received from {addr[0]}! Skipping {BLEED_SKIP_PACKETS} packets of bleed..."
-        )
 
 
 def load_silero_vad() -> None:
@@ -281,6 +241,43 @@ def load_silero_vad() -> None:
     model.eval()
     vad_model = model
     print(f"{ts()} Silero VAD model loaded.", flush=True)
+
+
+_last_wake_time: float = 0.0
+_WAKE_COOLDOWN_S: float = 1.5
+
+
+def on_mqtt_message(client, userdata, msg) -> None:
+    """MQTT callback — fires when a message arrives on any subscribed topic.
+    Replaces control_listener(). Currently handles elio/wake only.
+    """
+    global listen_state, bleed_remaining, _last_wake_time
+
+    if msg.topic != TOPIC_WAKE:
+        return
+
+    if RECORDING_MODE:
+        return
+
+    now = time.monotonic()
+    if now - _last_wake_time < _WAKE_COOLDOWN_S:
+        return
+    _last_wake_time = now
+
+    with state_lock:
+        if listen_state != ListenState.IDLE:
+            print(
+                f"{ts()} [CTRL] Wake signal received but state is "
+                f"{listen_state.name}, ignoring."
+            )
+            return
+        listen_state = ListenState.SKIP_WAKEWORD_BLEED
+        bleed_remaining = BLEED_SKIP_PACKETS
+
+    print(
+        f"\n{ts()} [WAKE] Wake word received via MQTT! "
+        f"Skipping {BLEED_SKIP_PACKETS} packets of bleed..."
+    )
 
 
 def vad_accumulator_loop() -> None:
@@ -376,8 +373,8 @@ def vad_accumulator_loop() -> None:
                     # 0x03 doubles as chime-stop; at this point the chime loop
                     # hasn't started yet (0x02 fires after), so on the ESP32 side
                     # this only has the LED effect.
-                    send_chime_stop()
-                    send_ctrl(CTRL_PROCESSING_ON, repeat=3)
+                    mqtt_send_ctrl("stop")
+                    mqtt_send_ctrl("processing")
                 else:
                     print(
                         f"\n{ts()} [VAD] Segment too short ({len(accumulator)} pkts), discarding"
@@ -686,25 +683,15 @@ def send_audio_esp32(pcm_int16: np.ndarray) -> None:
         # If remaining < 0, we're behind — skip sleep, catch up immediately
 
 
-def send_ctrl(byte_value: int, repeat: int = 3) -> None:
-    """
-    Send a control byte to ESP32.
-    UDP can drop packets, so important control commands are sent more than once.
+def mqtt_send_ctrl(payload: str) -> None:
+    """Publish a control command to the ESP32 via MQTT.
+    Replaces send_ctrl() and send_chime_stop().
+    payload must be one of: "processing" | "stop"
     """
     try:
-        for _ in range(repeat):
-            audio_send_sock.sendto(bytes([byte_value]), (ESP32_IP, ESP32_CTRL_TX_PORT))
-            time.sleep(0.02)
+        mqtt_client.publish(TOPIC_CTRL, payload)
     except Exception as exc:
-        print(f"{ts()} [CTRL] Failed to send byte {byte_value}: {exc}", flush=True)
-
-
-def send_chime_stop() -> None:
-    """Tell the ESP32 to stop the latency chime loop and turn off the LED.
-    Called on any pipeline path that resets to IDLE without sending TTS audio.
-    The ESP32 handles 0x03 as an immediate chime-loop stop signal.
-    """
-    send_ctrl(CTRL_STOP_ALL, repeat=3)
+        print(f"{ts()} [CTRL] MQTT publish failed ({payload!r}): {exc}", flush=True)
 
 
 def reset_to_idle(reason: str = "") -> None:
@@ -715,7 +702,7 @@ def reset_to_idle(reason: str = "") -> None:
     """
     global listen_state, accumulator, silence_packets, is_responding, leftover
 
-    send_chime_stop()
+    mqtt_send_ctrl("stop")
 
     with queue_lock:
         is_responding = False
@@ -1047,6 +1034,17 @@ def main() -> None:
     sock.settimeout(1.0)
     print(f"{ts()} Listening for UDP audio on port {UDP_PORT}...")
 
+    # MQTT startup — always active (wake signals must work in RECORDING_MODE too
+    # if you ever want them; in normal mode this is required for wake word)
+    mqtt_client.on_message = on_mqtt_message
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
+    mqtt_client.subscribe(TOPIC_WAKE)
+    mqtt_client.loop_start()  # spawns a daemon thread; no manual thread needed
+    print(
+        f"{ts()} MQTT client connected to {MQTT_BROKER}:{MQTT_PORT}, "
+        f"subscribed to {TOPIC_WAKE}"
+    )
+
     # Start all background threads
     threads = []
     for target, args in [
@@ -1058,7 +1056,6 @@ def main() -> None:
 
     if not RECORDING_MODE:
         for target, args in [
-            (control_listener, ()),
             (vad_accumulator_loop, ()),
             (transcription_loop, ()),
             (llm_loop, ()),
@@ -1103,7 +1100,9 @@ def main() -> None:
         shutdown_event.set()
 
         # Tell ESP32 to turn off LED / stop chime
-        send_chime_stop()
+        mqtt_send_ctrl("stop")
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
 
         # Unblock any thread stuck on queue.get() with sentinel values
         llm_queue.put(None)
