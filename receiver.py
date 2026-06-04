@@ -1050,10 +1050,10 @@ def main() -> None:
             threads.append(t)
 
         # Fire warmup in background — don't block startup or the pre-buffer wait
-        warmup_thread = threading.Thread(
-            target=warmup_connections, daemon=True, name="Warmup"
-        )
-        warmup_thread.start()
+        # warmup_thread = threading.Thread(
+        #     target=warmup_connections, daemon=True, name="Warmup"
+        # )
+        # warmup_thread.start()
 
     print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     deadline = time.monotonic() + 10.0  # wait at most 10 seconds
