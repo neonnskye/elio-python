@@ -1,3 +1,5 @@
+import time
+
 from openai import OpenAI
 
 client = OpenAI(
@@ -24,6 +26,8 @@ while True:
 
     print("Assistant: ", end="", flush=True)
 
+    start_time = time.perf_counter()
+
     stream = client.chat.completions.create(
         model="deepseek/deepseek-v4-flash",
         messages=messages,
@@ -37,5 +41,6 @@ while True:
             print(delta.content, end="", flush=True)
             assistant_reply += delta.content
 
-    print()  # newline after response
+    elapsed = time.perf_counter() - start_time
+    print(f"\n⏱ {elapsed:.2f}s\n")
     messages.append({"role": "assistant", "content": assistant_reply})
