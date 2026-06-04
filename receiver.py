@@ -437,9 +437,11 @@ def transcription_loop() -> None:
             flush=True,
         )
 
+        t0 = time.monotonic()
         t = threading.Thread(target=do_transcribe, daemon=True)
         t.start()
         t.join(timeout=STT_TIMEOUT_S)
+        stt_elapsed = time.monotonic() - t0
 
         if t.is_alive():
             print(
@@ -456,7 +458,7 @@ def transcription_loop() -> None:
 
         text = result_holder.get("text", "").strip()
         if text:
-            print(f"{ts()} [transcript] {text}")
+            print(f"{ts()} [STT] {stt_elapsed:.2f}s → {text}")
             word_count = len(text.split())
             if word_count <= 3:
                 print(
@@ -610,7 +612,8 @@ def llm_loop() -> None:
             if sanitized != collected:
                 print(f"\n{ts()} [LLM] Sanitized: {sanitized}")
             else:
-                print()  # newline after streamed response
+                llm_elapsed = time.monotonic() - stream_start
+                print(f"\n{ts()} [LLM] {llm_elapsed:.2f}s", flush=True)
 
             # Commit assistant reply to history (only if we have a real response)
             if collected:
@@ -815,9 +818,11 @@ def tts_loop() -> None:
 
         print(f"{ts()} [TTS] Synthesizing {len(text)} chars...", flush=True)
 
+        t0 = time.monotonic()
         t = threading.Thread(target=do_tts, daemon=True)
         t.start()
         t.join(timeout=TTS_TIMEOUT_S)
+        tts_elapsed = time.monotonic() - t0
 
         if t.is_alive():
             print(
@@ -860,7 +865,7 @@ def tts_loop() -> None:
                 audio_queue.append(pcm_int16)
             audio_queue_event.set()
             print(
-                f"{ts()} [TTS] Queued {len(pcm_resampled)} samples for playback ({AUDIO_OUTPUT})",
+                f"{ts()} [TTS] {tts_elapsed:.2f}s → queued {len(pcm_resampled)} samples ({AUDIO_OUTPUT})",
                 flush=True,
             )
 
