@@ -124,17 +124,83 @@ BLEED_SKIP_PACKETS = (
 
 
 def resolve_mdns(hostname: str, timeout: int = 15) -> str:
-    """Resolve a .local mDNS hostname to an IP, retrying for up to `timeout` seconds."""
+    """Resolve a .local mDNS hostname to an IP address.
+
+    Uses zeroconf directly to bypass the OS resolver (avahi NSS / Bonjour),
+    which can block for 3-8 seconds on a cold cache. The zeroconf path sends
+    a raw multicast A-record query and polls the response cache at 50ms
+    intervals, typically resolving in under 500ms.
+
+    Falls back to socket.getaddrinfo() (with a 3s per-attempt thread timeout)
+    if zeroconf is unavailable.
+    """
     fqdn = hostname if hostname.endswith(".local") else f"{hostname}.local"
-    print(f"Resolving {fqdn} via mDNS...")
-    for attempt in range(timeout):
+    # zeroconf cache keys always include the trailing dot
+    fqdn_dot = fqdn if fqdn.endswith(".") else fqdn + "."
+    print(f"{ts()} Resolving {fqdn} via mDNS...", flush=True)
+    t0 = time.monotonic()
+
+    # --- Fast path: direct zeroconf A-record query ---
+    # Stable import locations for modern zeroconf (0.32+):
+    #   - _TYPE_A / _CLASS_IN  -> zeroconf.const
+    #   - DNSOutgoing          -> zeroconf._protocol.outgoing
+    #   - DNSAddress / DNSQuestion -> zeroconf._dns
+    # Older versions exported these from the top-level package; those were
+    # removed, hence the ImportError you saw.
+    try:
+        from zeroconf import Zeroconf
+        from zeroconf._dns import DNSAddress, DNSQuestion
+        from zeroconf._protocol.outgoing import DNSOutgoing
+        from zeroconf.const import _CLASS_IN, _TYPE_A
+
+        zc = Zeroconf()
+        deadline = time.monotonic() + timeout
         try:
-            ip = socket.getaddrinfo(fqdn, None)[0][4][0]
-            print(f"Resolved {fqdn} -> {ip}")
-            return ip
+            # Fire an mDNS query; the ESP32's response will populate zc.cache
+            out = DNSOutgoing(0x0000)  # FLAGS_QR_QUERY = 0
+            out.add_question(DNSQuestion(fqdn_dot, _TYPE_A, _CLASS_IN))
+            zc.send(out)
+
+            while time.monotonic() < deadline:
+                record = zc.cache.get_by_details(fqdn_dot, _TYPE_A, _CLASS_IN)
+                if record and isinstance(record, DNSAddress):
+                    ip = socket.inet_ntoa(record.address)
+                    elapsed = time.monotonic() - t0
+                    print(f"{ts()} Resolved {fqdn} -> {ip} (zeroconf, {elapsed:.2f}s)")
+                    return ip
+                time.sleep(0.05)
+        finally:
+            zc.close()
+        print(f"{ts()} zeroconf timed out, falling back to OS resolver...", flush=True)
+    except Exception as exc:
+        print(
+            f"{ts()} zeroconf unavailable ({exc}), falling back to OS resolver...",
+            flush=True,
+        )
+
+    # --- Fallback: OS resolver ---
+    # socket.getaddrinfo() can block for several seconds per call on a cold
+    # avahi/Bonjour cache, so we run each attempt in a daemon thread with a
+    # hard 3s timeout to prevent a single hung call from eating all the time.
+    def _try_getaddrinfo(out: list) -> None:
+        try:
+            out.append(socket.getaddrinfo(fqdn, None)[0][4][0])
         except socket.gaierror:
-            print(f"  attempt {attempt + 1}/{timeout} failed, retrying...")
-            time.sleep(1)
+            pass
+
+    for attempt in range(timeout):
+        result: list = []
+        t = threading.Thread(target=_try_getaddrinfo, args=(result,), daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        if result:
+            elapsed = time.monotonic() - t0
+            print(
+                f"{ts()} Resolved {fqdn} -> {result[0]} (OS resolver, {elapsed:.2f}s)"
+            )
+            return result[0]
+        print(f"  attempt {attempt + 1}/{timeout} failed, retrying...")
+
     raise RuntimeError(
         f"mDNS resolution failed for {fqdn} after {timeout}s. "
         "Ensure avahi-daemon is running on the Pi, or Bonjour is running on Windows."
@@ -169,7 +235,7 @@ def start_windows_mdns_broadcast(service_name: str = "raspberrypi") -> None:
     zc = Zeroconf()
     zc.register_service(info)
     print(
-        f"[Windows] Broadcasting this machine as '{service_name}.local' ({local_ip}) via zeroconf"
+        f"{ts()} [Windows] Broadcasting this machine as '{service_name}.local' ({local_ip}) via zeroconf"
     )
     # zc intentionally not unregistered — runs for the lifetime of the script
 
@@ -207,7 +273,9 @@ history_lock = threading.Lock()
 # UDP socket for sending TTS audio to ESP32
 audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-mqtt_client = mqtt.Client(client_id="elio-receiver")
+mqtt_client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="elio-receiver"
+)
 
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
@@ -990,6 +1058,12 @@ def main() -> None:
         f"{ts()} MQTT client connected to {MQTT_BROKER}:{MQTT_PORT}, "
         f"subscribed to {TOPIC_WAKE}"
     )
+
+    # On startup, force-clear any LED / chime state left over from a previous run
+    # where the script was killed before it could send "stop" to the ESP32.
+    time.sleep(0.1)  # let the MQTT loop_start thread establish the session
+    mqtt_send_ctrl("stop")
+    print(f"{ts()} Sent startup 'stop' to clear any stale LED/chime state.")
 
     # Start all background threads
     threads = []
