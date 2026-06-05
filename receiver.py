@@ -1,7 +1,7 @@
-# pip install paho-mqtt
 import collections
 import io
 import os
+import platform
 import queue
 import re
 import socket
@@ -62,7 +62,8 @@ RECORDING_MODE = False
 
 # Audio output routing
 AUDIO_OUTPUT = "esp32"  # "local" | "esp32" | "both"
-ESP32_IP = "172.20.10.3"  # must match IP printed by ESP32 on boot — adjust if different
+ESP32_MDNS_HOST = "esp32-audio"  # mDNS hostname broadcast by the ESP32
+ESP32_IP = ""  # resolved via mDNS at startup
 ESP32_AUDIO_PORT = 12347
 AUDIO_SEND_CHUNK = 512  # samples per UDP packet
 AUDIO_SEND_RATE = 16000  # Hz
@@ -176,7 +177,7 @@ CONVERSATION_HISTORY_MAX_TURNS = (
 )
 
 # Wake word gating
-MQTT_BROKER = "172.20.10.5"  # change to broker IP if not running locally
+MQTT_BROKER = "127.0.0.1"  # broker runs locally
 MQTT_PORT = 1883
 TOPIC_WAKE = "elio/wake"
 TOPIC_CTRL = "elio/ctrl"
@@ -184,6 +185,58 @@ TOPIC_CTRL = "elio/ctrl"
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
 )
+
+
+def resolve_mdns(hostname: str, timeout: int = 15) -> str:
+    """Resolve a .local mDNS hostname to an IP, retrying for up to `timeout` seconds."""
+    fqdn = hostname if hostname.endswith(".local") else f"{hostname}.local"
+    print(f"Resolving {fqdn} via mDNS...")
+    for attempt in range(timeout):
+        try:
+            ip = socket.getaddrinfo(fqdn, None)[0][4][0]
+            print(f"Resolved {fqdn} -> {ip}")
+            return ip
+        except socket.gaierror:
+            print(f"  attempt {attempt + 1}/{timeout} failed, retrying...")
+            time.sleep(1)
+    raise RuntimeError(
+        f"mDNS resolution failed for {fqdn} after {timeout}s. "
+        "Ensure avahi-daemon is running on the Pi, or Bonjour is running on Windows."
+    )
+
+
+def start_windows_mdns_broadcast(service_name: str = "raspberrypi") -> None:
+    """
+    On Windows, broadcast this machine as `<service_name>.local` via zeroconf.
+    Not needed on Linux/macOS where avahi/mDNS handles this at the OS level.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        from zeroconf import ServiceInfo, Zeroconf
+    except ImportError:
+        print(
+            "WARNING: zeroconf package not installed. "
+            "Run `pip install zeroconf` to enable mDNS broadcast on Windows."
+        )
+        return
+
+    local_ip = socket.gethostbyname(socket.gethostname())
+    info = ServiceInfo(
+        "_http._tcp.local.",
+        f"{service_name}._http._tcp.local.",
+        addresses=[socket.inet_aton(local_ip)],
+        port=80,
+        properties={},
+        server=f"{service_name}.local.",
+    )
+    zc = Zeroconf()
+    zc.register_service(info)
+    print(
+        f"[Windows] Broadcasting this machine as '{service_name}.local' ({local_ip}) via zeroconf"
+    )
+    # zc intentionally not unregistered — runs for the lifetime of the script
+
 
 listen_state = ListenState.IDLE
 bleed_remaining = 0
@@ -985,6 +1038,14 @@ def main() -> None:
             f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
         )
         load_silero_vad()
+
+    global ESP32_IP
+
+    # Broadcast this machine as raspberrypi.local on Windows (no-op on Linux/Pi)
+    start_windows_mdns_broadcast("raspberrypi")
+
+    # Resolve ESP32's mDNS hostname to an IP for sending TTS audio back
+    ESP32_IP = resolve_mdns(ESP32_MDNS_HOST)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
