@@ -25,6 +25,7 @@ import torch
 TTS_TURN_DONE = object()
 from groq import Groq
 from openai import OpenAI
+from piper import PiperVoice
 
 
 def ts() -> str:
@@ -72,16 +73,11 @@ AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pa
 # Groq STT config
 GROQ_MODEL = "whisper-large-v3"
 
-# TTS config (uses OpenRouter)
-TTS_MODEL = "hexgrad/kokoro-82m"
-TTS_VOICE = "af_bella"
-TTS_REFERER = (
-    "https://github.com/neonnskye/esp32-audio"  # Optional, for OpenRouter rankings
+# TTS config (Piper local)
+PIPER_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "en_US-hfc_female-medium.onnx"
 )
-TTS_TITLE = "Elio"  # Optional, for OpenRouter rankings
-TTS_PCM_RATE = 24000  # OpenAI TTS PCM output sample rate
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+TTS_PCM_RATE = 22050  # Piper medium-quality voices output at 22050 Hz
 
 # LLM config
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
@@ -770,10 +766,7 @@ def audio_dispatch_loop() -> None:
 def tts_loop() -> None:
     global listen_state, is_responding
 
-    tts_client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-    )
+    voice = PiperVoice.load(PIPER_MODEL_PATH)
 
     while not shutdown_event.is_set():
         try:
@@ -783,29 +776,19 @@ def tts_loop() -> None:
         if text is None:
             break
         if text is TTS_TURN_DONE:
-            # End of one LLM turn — forward None as end-of-turn sentinel to audio dispatch
             with audio_queue_lock:
                 audio_queue.append(None)
             audio_queue_event.set()
             continue
+
         result_holder = {}
 
         def do_tts():
             try:
-                with tts_client.audio.speech.with_streaming_response.create(
-                    extra_headers={
-                        "HTTP-Referer": TTS_REFERER,
-                        "X-OpenRouter-Title": TTS_TITLE,
-                    },
-                    model=TTS_MODEL,
-                    voice=TTS_VOICE,
-                    input=text,
-                    response_format="pcm",
-                ) as response:
-                    buf = io.BytesIO()
-                    for chunk in response.iter_bytes():
-                        buf.write(chunk)
-                    result_holder["audio"] = buf.getvalue()
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wav_file:
+                    voice.synthesize_wav(text, wav_file)
+                result_holder["audio"] = buf.getvalue()
             except Exception as exc:
                 result_holder["error"] = exc
 
@@ -832,12 +815,8 @@ def tts_loop() -> None:
 
         try:
             audio_bytes = result_holder["audio"]
-            pcm_int16_raw = np.frombuffer(audio_bytes, dtype=np.int16)
-            pcm_float = pcm_int16_raw.astype(np.float32) / 32768.0
-            src_rate = TTS_PCM_RATE
+            pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
 
-            # Compute exact resampling ratio from TTS PCM rate to pipeline rate
-            # Using GCD reduction ensures resample_poly gets the smallest valid integer ratio
             g = gcd(src_rate, AUDIO_SEND_RATE)
             up = AUDIO_SEND_RATE // g
             down = src_rate // g
@@ -849,7 +828,6 @@ def tts_loop() -> None:
 
             pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
 
-            # Convert to int16 for routing to ESP32 and/or local playback
             pcm_int16 = (
                 (pcm_resampled * 0.95 * 32767).clip(-32768, 32767).astype(np.int16)
             )
@@ -975,7 +953,7 @@ def main() -> None:
         )
     else:
         print(
-            f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
+            f"{ts()} Using Groq STT model '{GROQ_MODEL}', Piper TTS model '{PIPER_MODEL_PATH}'"
         )
         load_silero_vad()
 
