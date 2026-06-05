@@ -817,6 +817,11 @@ def tts_loop() -> None:
             audio_bytes = result_holder["audio"]
             pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
 
+            print(
+                f"{ts()} [TTS] WAV: {src_rate}Hz, peak={np.max(np.abs(pcm_float)):.3f}",
+                flush=True,
+            )
+
             g = gcd(src_rate, AUDIO_SEND_RATE)
             up = AUDIO_SEND_RATE // g
             down = src_rate // g
@@ -827,6 +832,11 @@ def tts_loop() -> None:
             )
 
             pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
+
+            # Normalize AFTER resampling (ringing can push peak above 1.0)
+            peak = np.max(np.abs(pcm_resampled))
+            if peak > 0:
+                pcm_resampled = pcm_resampled / peak
 
             pcm_int16 = (
                 (pcm_resampled * 0.95 * 32767).clip(-32768, 32767).astype(np.int16)
