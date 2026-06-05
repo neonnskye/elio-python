@@ -18,14 +18,14 @@ import paho.mqtt.client as mqtt
 import scipy.signal
 import sounddevice as sd
 import torch
+from groq import Groq
+from openai import OpenAI
+from piper import PiperVoice
 
 # Sentinel pushed onto tts_queue after all sentences from one LLM turn are queued.
 # tts_loop forwards it to audio_queue as None, which audio_dispatch_loop uses to
 # call reset_to_idle exactly once per turn instead of once per sentence.
 TTS_TURN_DONE = object()
-from groq import Groq
-from openai import OpenAI
-from piper import PiperVoice
 
 
 def ts() -> str:
