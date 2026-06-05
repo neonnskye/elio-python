@@ -975,43 +975,6 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
     outdata[:, 0] = output
 
 
-def warmup_connections() -> None:
-    """Fire a silent warmup request to the DeepSeek LLM on startup.
-
-    DeepSeek caches the KV state of the system prompt after the first call.
-    Subsequent calls with the same system prompt get a cache hit, which is
-    the main source of first-interaction latency. This primes that cache
-    before the user ever speaks. Runs in a daemon thread; never touches
-    pipeline state, history, or ESP32 audio.
-    """
-    print(f"{ts()} [WARMUP] Priming DeepSeek prompt cache...", flush=True)
-
-    llm_client = OpenAI(
-        base_url=DEEPSEEK_BASE_URL,
-        api_key=DEEPSEEK_API_KEY,
-    )
-
-    try:
-        t0 = time.monotonic()
-        stream = llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                {"role": "user", "content": "Hey Elio, how are you doing?"},
-            ],
-            stream=True,
-            max_tokens=60,
-        )
-        # Drain the stream fully so the system prompt KV cache is committed
-        for _ in stream:
-            pass
-        print(
-            f"{ts()} [WARMUP] Cache primed ({time.monotonic() - t0:.2f}s)", flush=True
-        )
-    except Exception as exc:
-        print(f"{ts()} [WARMUP] Warmup failed (non-fatal): {exc}", flush=True)
-
-
 def main() -> None:
     if RECORDING_MODE:
         print(
@@ -1060,13 +1023,7 @@ def main() -> None:
             t.start()
             threads.append(t)
 
-        # Fire warmup in background — don't block startup or the pre-buffer wait
-        # warmup_thread = threading.Thread(
-        #     target=warmup_connections, daemon=True, name="Warmup"
-        # )
-        # warmup_thread.start()
-
-    print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
+        print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     deadline = time.monotonic() + 10.0  # wait at most 10 seconds
     while True:
         with queue_lock:
