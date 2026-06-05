@@ -1,3 +1,6 @@
+# First downsample
+# ffmpeg -i .\assets\latency.wav -ar 22050 -ac 1 latency.wav
+
 import argparse
 import os
 import wave
