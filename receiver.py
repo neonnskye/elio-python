@@ -839,7 +839,7 @@ def tts_loop() -> None:
                 pcm_resampled = pcm_resampled / peak
 
             pcm_int16 = (
-                (pcm_resampled * 0.95 * 32767).clip(-32768, 32767).astype(np.int16)
+                (pcm_resampled * 0.6 * 32767).clip(-32768, 32767).astype(np.int16)
             )
 
             with audio_queue_lock:
