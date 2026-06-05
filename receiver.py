@@ -1037,6 +1037,40 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
     outdata[:, 0] = output
 
 
+def warmup_llm() -> None:
+    """
+    Fire a single non-streaming request to DeepSeek on startup to cache the
+    system prompt and eliminate cold-start latency on the first real user turn.
+    The response is discarded — this is purely a cache-priming call.
+    """
+    print(f"{ts()} [LLM] Warming up DeepSeek (caching system prompt)...", flush=True)
+    t0 = time.monotonic()
+    try:
+        llm_client = OpenAI(
+            base_url=DEEPSEEK_BASE_URL,
+            api_key=DEEPSEEK_API_KEY,
+        )
+        llm_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": "Hey Elio, this is a warmup message from the system — no need to respond with anything meaningful, just making sure you're ready to go.",
+                },
+            ],
+            max_tokens=16,  # we don't care about the reply, keep it tiny
+            stream=False,
+        )
+        elapsed = time.monotonic() - t0
+        print(
+            f"{ts()} [LLM] Warmup complete ({elapsed:.2f}s) — system prompt cached.",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"{ts()} [LLM] Warmup failed ({exc}) — continuing anyway.", flush=True)
+
+
 def main() -> None:
     if RECORDING_MODE:
         print(
@@ -1098,6 +1132,8 @@ def main() -> None:
             t = threading.Thread(target=target, args=args, daemon=True)
             t.start()
             threads.append(t)
+
+        warmup_llm()
 
         print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     deadline = time.monotonic() + 10.0  # wait at most 10 seconds
