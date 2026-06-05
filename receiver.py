@@ -287,19 +287,32 @@ MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 vad_model = None
 
 
+import os
+from pathlib import Path
+
+
 def load_silero_vad() -> None:
-    """Load the Silero VAD model at startup."""
+    """Load the Silero VAD model from the local models directory."""
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
+
+    # Define the local path to your VAD model directory
+    local_vad_path = Path(__file__).parent / "models" / "silero-vad"
+
+    if not local_vad_path.exists():
+        raise FileNotFoundError(f"VAD model directory not found at {local_vad_path}")
+
+    # Load using source="local"
     model, _ = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
+        repo_or_dir=str(local_vad_path),
         model="silero_vad",
-        force_reload=False,
+        source="local",  # Tells PyTorch to look at the local disk, not GitHub
         trust_repo=True,
     )
+
     model.eval()
     vad_model = model
-    print(f"{ts()} Silero VAD model loaded.", flush=True)
+    print(f"{ts()} Silero VAD model loaded from local directory.", flush=True)
 
 
 _last_wake_time: float = 0.0
