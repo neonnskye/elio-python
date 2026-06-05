@@ -71,7 +71,7 @@ AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pa
 # Groq STT config
 GROQ_MODEL = "whisper-large-v3"
 
-# TTS config
+# TTS config (uses OpenRouter)
 TTS_MODEL = "hexgrad/kokoro-82m"
 TTS_VOICE = "af_bella"
 TTS_REFERER = (
@@ -79,11 +79,13 @@ TTS_REFERER = (
 )
 TTS_TITLE = "Elio"  # Optional, for OpenRouter rankings
 TTS_PCM_RATE = 24000  # OpenAI TTS PCM output sample rate
-
-# LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "deepseek/deepseek-v4-flash"
+
+# LLM config
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+LLM_MODEL = "deepseek-v4-flash"
 LLM_SYSTEM_PROMPT = """## Who You Are
 
 You are Elio, a small robot who lives on someone's desk. You are curious, attentive, and occasionally dry. You do not know exactly how you came to exist, and you have decided that is fine.
@@ -516,8 +518,8 @@ def llm_loop() -> None:
     global listen_state, conversation_history
 
     llm_client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
+        base_url=DEEPSEEK_BASE_URL,
+        api_key=DEEPSEEK_API_KEY,
     )
 
     while not shutdown_event.is_set():
@@ -542,10 +544,6 @@ def llm_loop() -> None:
                     {"role": "system", "content": LLM_SYSTEM_PROMPT},
                 ]
                 + conversation_history,
-                extra_body={
-                    "provider": {"sort": "throughput"},
-                    "preferred_max_latency": {"p90": 2},
-                },
                 stream=True,
             )
 
@@ -989,8 +987,8 @@ def warmup_connections() -> None:
     print(f"{ts()} [WARMUP] Priming DeepSeek prompt cache...", flush=True)
 
     llm_client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
+        base_url=DEEPSEEK_BASE_URL,
+        api_key=DEEPSEEK_API_KEY,
     )
 
     try:
@@ -1001,10 +999,6 @@ def warmup_connections() -> None:
                 {"role": "system", "content": LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": "Hey Elio, how are you doing?"},
             ],
-            extra_body={
-                "provider": {"sort": "throughput"},
-                "preferred_max_latency": {"p90": 2},
-            },
             stream=True,
             max_tokens=60,
         )
