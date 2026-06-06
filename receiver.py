@@ -1,4 +1,5 @@
 import collections
+import concurrent.futures
 import io
 import os
 import platform
@@ -12,6 +13,7 @@ import wave
 from datetime import datetime
 from enum import Enum, auto
 from math import gcd
+from pathlib import Path
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -23,8 +25,8 @@ from openai import OpenAI
 from piper import PiperVoice
 
 # Sentinel pushed onto tts_queue after all sentences from one LLM turn are queued.
-# tts_loop forwards it to audio_queue as None, which audio_dispatch_loop uses to
-# call reset_to_idle exactly once per turn instead of once per sentence.
+# tts_dispatcher_loop forwards it to audio_queue (via audio_collector_loop) as None,
+# which audio_dispatch_loop uses to call reset_to_idle exactly once per turn.
 TTS_TURN_DONE = object()
 
 
@@ -252,7 +254,7 @@ leftover: np.ndarray = np.zeros(0, dtype=np.float32)
 response_queue: collections.deque = collections.deque()
 is_responding: bool = False
 
-# TTS queue for LLM responses to be spoken aloud
+# TTS queue for LLM responses to be spoken aloud (text sentences)
 tts_queue: queue.Queue = queue.Queue()
 
 # Queue for completed TTS audio (decouples synthesis from playback dispatch)
@@ -285,10 +287,6 @@ MIN_SPEECH_PACKETS = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 
 vad_model = None
-
-
-import os
-from pathlib import Path
 
 
 def load_silero_vad() -> None:
@@ -822,6 +820,183 @@ def play_audio(pcm_int16: np.ndarray) -> None:
         send_audio_esp32(pcm_int16)
 
 
+# =============================================================================
+# NEW: True Streaming LLM → TTS Pipeline
+# =============================================================================
+# The old tts_loop blocked on each sentence synthesis, meaning sentence N+1
+# could not start synthesising until sentence N was fully rendered.  With a
+# ThreadPoolExecutor we can overlap synthesis of consecutive sentences (up to
+# TTS_MAX_WORKERS at a time).  An audio_collector_loop ensures playback still
+# happens in the correct order.
+# -----------------------------------------------------------------------------
+
+TTS_MAX_WORKERS = 2  # Piper/ONNX releases the GIL, so 2 workers helps on multi-core
+
+# Global Piper voice handle — loaded in main() before threads start
+piper_voice: PiperVoice | None = None
+
+# Monotonic sequence counter for sentences within a turn (resets each turn via
+# the done-sentinel logic in audio_collector_loop)
+tts_sequence = 0
+tts_seq_lock = threading.Lock()
+
+# Queue that carries (seq, audio_int16|Exception|None) from executor callbacks
+# to the collector thread.  None means "end of turn".
+audio_ready_queue: queue.Queue = queue.Queue()
+
+# ThreadPoolExecutor for concurrent TTS synthesis
+tts_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def synthesize_text(text: str) -> np.ndarray:
+    """Synthesize a single text sentence to int16 PCM using Piper.
+
+    This function is executed inside the ThreadPoolExecutor.  It keeps the
+    same timeout, resampling and normalisation logic as the old tts_loop.
+    """
+    result_holder = {}
+
+    def _do_synth():
+        try:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wav_file:
+                piper_voice.synthesize_wav(text, wav_file)
+            result_holder["audio"] = buf.getvalue()
+        except Exception as exc:
+            result_holder["error"] = exc
+
+    # Run Piper synthesis in a sub-thread so we can enforce a hard timeout
+    t = threading.Thread(target=_do_synth, daemon=True)
+    t.start()
+    t.join(timeout=TTS_TIMEOUT_S)
+
+    if t.is_alive():
+        raise TimeoutError(f"TTS synthesis timed out after {TTS_TIMEOUT_S}s")
+
+    if "error" in result_holder:
+        raise result_holder["error"]
+
+    audio_bytes = result_holder["audio"]
+    pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
+
+    print(
+        f"{ts()} [TTS] WAV: {src_rate}Hz, peak={np.max(np.abs(pcm_float)):.3f}",
+        flush=True,
+    )
+
+    g = gcd(src_rate, AUDIO_SEND_RATE)
+    up = AUDIO_SEND_RATE // g
+    down = src_rate // g
+
+    print(
+        f"{ts()} [TTS] PCM sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz",
+        flush=True,
+    )
+
+    pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
+
+    # Normalize AFTER resampling (ringing can push peak above 1.0)
+    peak = np.max(np.abs(pcm_resampled))
+    if peak > 0:
+        pcm_resampled = pcm_resampled / peak
+
+    pcm_int16 = (pcm_resampled * 0.5 * 32767).clip(-32768, 32767).astype(np.int16)
+    return pcm_int16
+
+
+def tts_dispatcher_loop() -> None:
+    """Consume text sentences from tts_queue and submit synthesis tasks.
+
+    Each sentence gets a monotonic sequence number.  When the LLM turn ends
+    a TTS_TURN_DONE sentinel is forwarded so audio_collector_loop knows to
+    inject the playback sentinel (None) at the correct position in the stream.
+    """
+    global tts_sequence
+
+    while not shutdown_event.is_set():
+        try:
+            text = tts_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if text is None:
+            break
+
+        if text is TTS_TURN_DONE:
+            with tts_seq_lock:
+                seq = tts_sequence
+                tts_sequence += 1
+            audio_ready_queue.put((seq, None))
+            continue
+
+        with tts_seq_lock:
+            seq = tts_sequence
+            tts_sequence += 1
+
+        def _on_done(fut: concurrent.futures.Future, s: int):
+            try:
+                audio = fut.result()
+                audio_ready_queue.put((s, audio))
+            except Exception as exc:
+                audio_ready_queue.put((s, exc))
+
+        print(f"{ts()} [TTS] Queuing seq={seq} ({len(text)} chars)...", flush=True)
+        future = tts_executor.submit(synthesize_text, text)
+        future.add_done_callback(lambda f, s=seq: _on_done(f, s))
+
+    # Graceful executor shutdown on exit
+    if tts_executor is not None:
+        tts_executor.shutdown(wait=False)
+
+
+def audio_collector_loop() -> None:
+    """Reorder TTS results by sequence and push them to audio_queue.
+
+    Because sentences may finish synthesis out of order (shorter sentences
+    render faster), we buffer out-of-order results and only release them to
+    the playback thread when the next expected sequence number arrives.
+    """
+    next_seq = 0
+    buffer: dict[int, np.ndarray | Exception | None] = {}
+
+    while not shutdown_event.is_set():
+        try:
+            seq, item = audio_ready_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if seq != next_seq:
+            buffer[seq] = item
+            continue
+
+        # Walk the sequential chain starting at next_seq
+        while True:
+            if item is None:
+                # End-of-turn sentinel → tell playback to call reset_to_idle
+                with audio_queue_lock:
+                    audio_queue.append(None)
+                audio_queue_event.set()
+                next_seq += 1
+            elif isinstance(item, Exception):
+                print(f"{ts()} [TTS error] seq={next_seq}: {item}", flush=True)
+                reset_to_idle("TTS synthesis error")
+                next_seq += 1
+            else:
+                with audio_queue_lock:
+                    audio_queue.append(item)
+                audio_queue_event.set()
+                print(
+                    f"{ts()} [TTS] seq={next_seq} → queued {len(item)} samples ({AUDIO_OUTPUT})",
+                    flush=True,
+                )
+                next_seq += 1
+
+            if next_seq in buffer:
+                item = buffer.pop(next_seq)
+            else:
+                break
+
+
 def audio_dispatch_loop() -> None:
     """Drain audio_queue and dispatch each sentence for playback.
     Runs in its own daemon thread, decoupled from TTS synthesis so the
@@ -837,103 +1012,13 @@ def audio_dispatch_loop() -> None:
                 item = audio_queue.popleft()
             if item is None:
                 # End-of-turn sentinel — reset state once, not once per sentence
-                time.sleep(0.25)  # drain delay: let ESP32 I2S DMA finish playing last packet
+                time.sleep(
+                    0.25
+                )  # drain delay: let ESP32 I2S DMA finish playing last packet
                 reset_to_idle("ESP32 playback finished")
             else:
                 play_audio(item)
         audio_queue_event.clear()
-
-
-def tts_loop() -> None:
-    global listen_state, is_responding
-
-    voice = PiperVoice.load(PIPER_MODEL_PATH)
-
-    while not shutdown_event.is_set():
-        try:
-            text: str = tts_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        if text is None:
-            break
-        if text is TTS_TURN_DONE:
-            with audio_queue_lock:
-                audio_queue.append(None)
-            audio_queue_event.set()
-            continue
-
-        result_holder = {}
-
-        def do_tts():
-            try:
-                buf = io.BytesIO()
-                with wave.open(buf, "wb") as wav_file:
-                    voice.synthesize_wav(text, wav_file)
-                result_holder["audio"] = buf.getvalue()
-            except Exception as exc:
-                result_holder["error"] = exc
-
-        print(f"{ts()} [TTS] Synthesizing {len(text)} chars...", flush=True)
-
-        t0 = time.monotonic()
-        t = threading.Thread(target=do_tts, daemon=True)
-        t.start()
-        t.join(timeout=TTS_TIMEOUT_S)
-        tts_elapsed = time.monotonic() - t0
-
-        if t.is_alive():
-            print(
-                f"{ts()} [TTS] TIMEOUT after {TTS_TIMEOUT_S}s — resetting to IDLE",
-                flush=True,
-            )
-            reset_to_idle("TTS timeout")
-            continue
-
-        if "error" in result_holder:
-            print(f"{ts()} [TTS error] {result_holder['error']}", flush=True)
-            reset_to_idle("TTS error")
-            continue
-
-        try:
-            audio_bytes = result_holder["audio"]
-            pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
-
-            print(
-                f"{ts()} [TTS] WAV: {src_rate}Hz, peak={np.max(np.abs(pcm_float)):.3f}",
-                flush=True,
-            )
-
-            g = gcd(src_rate, AUDIO_SEND_RATE)
-            up = AUDIO_SEND_RATE // g
-            down = src_rate // g
-
-            print(
-                f"{ts()} [TTS] PCM sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz",
-                flush=True,
-            )
-
-            pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
-
-            # Normalize AFTER resampling (ringing can push peak above 1.0)
-            peak = np.max(np.abs(pcm_resampled))
-            if peak > 0:
-                pcm_resampled = pcm_resampled / peak
-
-            pcm_int16 = (
-                (pcm_resampled * 0.6 * 32767).clip(-32768, 32767).astype(np.int16)
-            )
-
-            with audio_queue_lock:
-                audio_queue.append(pcm_int16)
-            audio_queue_event.set()
-            print(
-                f"{ts()} [TTS] {tts_elapsed:.2f}s → queued {len(pcm_resampled)} samples ({AUDIO_OUTPUT})",
-                flush=True,
-            )
-
-        except Exception as exc:
-            print(f"{ts()} [TTS error] (post-synthesis) {exc}", flush=True)
-            reset_to_idle("TTS post-synthesis error")
 
 
 def receive_loop(sock: socket.socket) -> None:
@@ -1072,6 +1157,8 @@ def warmup_llm() -> None:
 
 
 def main() -> None:
+    global ESP32_IP, piper_voice, tts_executor
+
     if RECORDING_MODE:
         print(
             f"{ts()} *** RECORDING MODE ACTIVE — all voice pipeline threads disabled ***"
@@ -1081,8 +1168,6 @@ def main() -> None:
             f"{ts()} Using Groq STT model '{GROQ_MODEL}', Piper TTS model '{PIPER_MODEL_PATH}'"
         )
         load_silero_vad()
-
-    global ESP32_IP
 
     # Broadcast this machine as raspberrypi.local on Windows (no-op on Linux/Pi)
     start_windows_mdns_broadcast("raspberrypi")
@@ -1112,6 +1197,15 @@ def main() -> None:
     mqtt_send_ctrl("stop")
     print(f"{ts()} Sent startup 'stop' to clear any stale LED/chime state.")
 
+    # Load Piper voice and create TTS executor before spawning worker threads
+    if not RECORDING_MODE:
+        print(f"{ts()} Loading Piper TTS voice...")
+        piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+        tts_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=TTS_MAX_WORKERS
+        )
+        print(f"{ts()} Piper loaded. TTS executor: {TTS_MAX_WORKERS} workers.")
+
     # Start all background threads
     threads = []
     for target, args in [
@@ -1126,7 +1220,8 @@ def main() -> None:
             (vad_accumulator_loop, ()),
             (transcription_loop, ()),
             (llm_loop, ()),
-            (tts_loop, ()),
+            (tts_dispatcher_loop, ()),
+            (audio_collector_loop, ()),
             (audio_dispatch_loop, ()),
         ]:
             t = threading.Thread(target=target, args=args, daemon=True)
@@ -1174,6 +1269,10 @@ def main() -> None:
 
         for t in threads:
             t.join(timeout=3.0)
+
+        # Shut down the TTS executor cleanly
+        if tts_executor is not None:
+            tts_executor.shutdown(wait=False)
 
         print(f"{ts()} All threads stopped. Goodbye.")
 
