@@ -808,7 +808,6 @@ def play_audio_local(pcm_int16: np.ndarray) -> None:
             if len(chunk) < SAMPLES_PER_PKT:
                 chunk = np.pad(chunk, (0, SAMPLES_PER_PKT - len(chunk)))
             response_queue.append(chunk)
-        response_queue.append(None)  # sentinel signals end of playback
 
 
 def play_audio(pcm_int16: np.ndarray) -> None:
@@ -838,6 +837,7 @@ def audio_dispatch_loop() -> None:
                 item = audio_queue.popleft()
             if item is None:
                 # End-of-turn sentinel — reset state once, not once per sentence
+                time.sleep(0.25)  # drain delay: let ESP32 I2S DMA finish playing last packet
                 reset_to_idle("ESP32 playback finished")
             else:
                 play_audio(item)
