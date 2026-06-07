@@ -119,6 +119,11 @@ MQTT_BROKER = "127.0.0.1"  # broker runs locally
 MQTT_PORT = 1883
 TOPIC_WAKE = "elio/wake"
 TOPIC_CTRL = "elio/ctrl"
+TOPIC_STATE = "elio/state"
+TOPIC_TRANSCRIPT_USER = "elio/transcript/user"
+TOPIC_TRANSCRIPT_ASST = "elio/transcript/assistant"
+TOPIC_SYSTEM_READY = "elio/system/ready"
+TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
 
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
@@ -344,6 +349,8 @@ def on_mqtt_message(client, userdata, msg) -> None:
         listen_state = ListenState.SKIP_WAKEWORD_BLEED
         bleed_remaining = BLEED_SKIP_PACKETS
 
+    mqtt_publish(TOPIC_STATE, "listening")
+
     print(
         f"\n{ts()} [WAKE] Wake word received via MQTT! "
         f"Skipping {BLEED_SKIP_PACKETS} packets of bleed..."
@@ -438,6 +445,7 @@ def vad_accumulator_loop() -> None:
                     )
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
+                    mqtt_publish(TOPIC_STATE, "transcribing")
                     transcribe_queue.put(segment)
                     # Turn off the listen LED — user has finished speaking.
                     # 0x03 doubles as chime-stop; at this point the chime loop
@@ -531,6 +539,7 @@ def transcription_loop() -> None:
         text = result_holder.get("text", "").strip()
         if text:
             print(f"{ts()} [STT] {stt_elapsed:.2f}s → {text}")
+            mqtt_publish(TOPIC_TRANSCRIPT_USER, text)
             word_count = len(text.split())
             if word_count <= 3:
                 print(
@@ -540,6 +549,7 @@ def transcription_loop() -> None:
             else:
                 with state_lock:
                     listen_state = ListenState.RESPONDING
+                mqtt_publish(TOPIC_STATE, "thinking")
                 llm_queue.put(text)
         else:
             reset_to_idle("empty transcript")
@@ -703,6 +713,8 @@ def llm_loop() -> None:
                     print(
                         f"{ts()} [LLM] History: {len(conversation_history)} messages stored."
                     )
+                    if collected:
+                        mqtt_publish(TOPIC_TRANSCRIPT_ASST, collected)
 
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
@@ -760,6 +772,17 @@ def mqtt_send_ctrl(payload: str) -> None:
         print(f"{ts()} [CTRL] MQTT publish failed ({payload!r}): {exc}", flush=True)
 
 
+def mqtt_publish(topic: str, payload: str) -> None:
+    if not mqtt_client.is_connected():
+        return
+    try:
+        mqtt_client.publish(topic, payload)
+    except Exception as exc:
+        print(
+            f"{ts()} [MQTT] Publish failed ({topic!r} {payload!r}): {exc}", flush=True
+        )
+
+
 def reset_to_idle(reason: str = "") -> None:
     """
     Reset Python state and always tell ESP32 to turn off LED/chime.
@@ -786,6 +809,7 @@ def reset_to_idle(reason: str = "") -> None:
 
     with state_lock:
         listen_state = ListenState.IDLE
+    mqtt_publish(TOPIC_STATE, "idle")
 
     if reason:
         print(f"{ts()} [STATE] Reset to IDLE: {reason}")
@@ -900,7 +924,7 @@ def synthesize_text(text: str) -> np.ndarray:
     if peak > 0:
         pcm_resampled = pcm_resampled / peak
 
-    pcm_int16 = (pcm_resampled * 0.5 * 32767).clip(-32768, 32767).astype(np.int16)
+    pcm_int16 = (pcm_resampled * 0.7 * 32767).clip(-32768, 32767).astype(np.int16)
     return pcm_int16
 
 
@@ -1017,6 +1041,7 @@ def audio_dispatch_loop() -> None:
                 )  # drain delay: let ESP32 I2S DMA finish playing last packet
                 reset_to_idle("ESP32 playback finished")
             else:
+                mqtt_publish(TOPIC_STATE, "speaking")
                 play_audio(item)
         audio_queue_event.clear()
 
@@ -1241,6 +1266,7 @@ def main() -> None:
             break
         time.sleep(0.01)
 
+    mqtt_publish(TOPIC_SYSTEM_READY, "1")
     print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
@@ -1258,6 +1284,7 @@ def main() -> None:
         shutdown_event.set()
 
         # Tell ESP32 to turn off LED / stop chime
+        mqtt_publish(TOPIC_SYSTEM_SHUTDOWN, "1")
         mqtt_send_ctrl("stop")
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
