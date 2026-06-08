@@ -1,46 +1,31 @@
-from picamera2 import Picamera2
 import cv2
 import time
 import json
 import socket
+import platform
+import signal
 import sys
 import paho.mqtt.client as mqtt
-from zeroconf import ServiceInfo, Zeroconf
 
-# ================= HOST CONNECTIVITY CHECK =================
-ESP32_HOST = "luna-motor-esp32.local"
-ESP32_PORT = 1883
-ESP32_TIMEOUT = 5  # seconds
+# ================= OPTIONAL ZEROCONF / mDNS =================
+# Install on Windows if needed:
+#   pip install zeroconf
+try:
+    from zeroconf import ServiceInfo, Zeroconf
+    ZEROCONF_AVAILABLE = True
+except Exception:
+    ZEROCONF_AVAILABLE = False
 
-def check_esp32_connection(host: str, port: int, timeout: int) -> None:
-    """
-    Resolve and TCP-ping the ESP32 before anything else starts.
-    Exits with a non-zero status code if the host is unreachable.
-    """
-    print(f"[startup] Checking connection to {host}:{port} ...")
-    try:
-        # getaddrinfo resolves .local via mDNS (requires avahi/bonjour on the Pi)
-        results = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        if not results:
-            raise OSError(f"Could not resolve {host}")
-        ip = results[0][4][0]
-        print(f"[startup] Resolved {host} -> {ip}")
-
-        # Attempt a real TCP connection to confirm the port is open
-        with socket.create_connection((ip, port), timeout=timeout):
-            pass
-
-        print(f"[startup] ✓ Connected to {host} ({ip}:{port}) — continuing startup.\n")
-
-    except OSError as exc:
-        print(f"[startup] ✗ Cannot reach {host}:{port} — {exc}")
-        print("[startup] Make sure luna-motor-esp32 is powered on and on the same network.")
-        sys.exit(1)
-
-check_esp32_connection(ESP32_HOST, ESP32_PORT, ESP32_TIMEOUT)
+# ================= SYSTEM MODE =================
+# AUTO:
+#   Windows laptop -> OpenCV webcam
+#   Raspberry Pi   -> Picamera2
+CAMERA_MODE = "AUTO"  # AUTO | WINDOWS | PI
 
 # ================= MQTT =================
-# MQTT broker runs on this Raspberry Pi
+# If Mosquitto runs on the same machine as this Python script:
+#   Windows laptop test: 127.0.0.1
+#   Raspberry Pi final: 127.0.0.1
 MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 
@@ -48,13 +33,43 @@ TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_STATUS = "luna/robot/status"
 TOPIC_ROBOT_SENSORS = "luna/robot/sensors"
 
-# ================= ZEROCONF =================
-ZEROCONF_SERVICE_TYPE = "_mqtt._tcp.local."
-ZEROCONF_SERVICE_NAME  = "raspberrypi._mqtt._tcp.local."
-ZEROCONF_HOSTNAME      = "raspberrypi.local."
+# ================= CAMERA SETTINGS =================
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+CAMERA_INDEX = 0
 
+# ================= FACE DETECTION =================
+def get_haarcascade_path():
+    p1 = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    p2 = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+
+    try:
+        open(p1, "r").close()
+        return p1
+    except Exception:
+        pass
+
+    try:
+        open(p2, "r").close()
+        return p2
+    except Exception:
+        pass
+
+    raise FileNotFoundError("Cannot find haarcascade_frontalface_default.xml")
+
+
+# ================= GLOBALS =================
+last_cmd = ""
+last_status = {}
+last_sensors = {}
+client = None
+camera = None
+zeroconf = None
+zeroconf_info = None
+
+
+# ================= mDNS HELPERS =================
 def get_local_ip():
-    """Return the primary non-loopback IPv4 address."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -64,43 +79,116 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
+
 def start_zeroconf():
+    """Advertise MQTT service as raspberrypi.local."""
+    if not ZEROCONF_AVAILABLE:
+        print("Zeroconf not installed. mDNS advertise skipped.")
+        print("Install with: pip install zeroconf")
+        return None, None
+
     local_ip = get_local_ip()
     packed_ip = socket.inet_aton(local_ip)
 
     info = ServiceInfo(
-        type_=ZEROCONF_SERVICE_TYPE,
-        name=ZEROCONF_SERVICE_NAME,
+        type_="_mqtt._tcp.local.",
+        name="raspberrypi._mqtt._tcp.local.",
         addresses=[packed_ip],
         port=MQTT_PORT,
         properties={
             "hostname": "raspberrypi",
-            "version": "1.0",
-            "service": "luna-pi-face",
+            "project": "Prometheus-LUNA",
+            "service": "mqtt-broker",
         },
-        server=ZEROCONF_HOSTNAME,
+        server="raspberrypi.local.",
     )
 
     zc = Zeroconf()
     zc.register_service(info)
-    print(f"Zeroconf: announced as raspberrypi.local ({local_ip}:{MQTT_PORT})")
+
+    print(f"mDNS/Zeroconf advertised: raspberrypi.local -> {local_ip}:{MQTT_PORT}")
     return zc, info
 
-zeroconf, zeroconf_info = start_zeroconf()
 
-# ================= FACE DETECTION =================
-face = cv2.CascadeClassifier(
-    "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
-)
+# ================= CAMERA HELPERS =================
+def is_raspberry_pi():
+    if platform.system().lower() != "linux":
+        return False
 
-cam = Picamera2()
-cam.configure(cam.create_preview_configuration(main={"size": (320, 240)}))
-cam.start()
-time.sleep(2)
+    try:
+        with open("/proc/device-tree/model", "r") as f:
+            model = f.read().lower()
+            return "raspberry pi" in model
+    except Exception:
+        return False
 
-last_cmd = ""
-last_status = {}
-last_sensors = {}
+
+def choose_camera_mode():
+    if CAMERA_MODE.upper() == "WINDOWS":
+        return "WINDOWS"
+
+    if CAMERA_MODE.upper() == "PI":
+        return "PI"
+
+    if is_raspberry_pi():
+        return "PI"
+
+    return "WINDOWS"
+
+
+class WindowsOpenCVCamera:
+    def __init__(self, index=0):
+        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(index)
+
+        if not self.cap.isOpened():
+            raise RuntimeError("Cannot open laptop webcam")
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+    def capture_array(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            raise RuntimeError("Cannot read frame from webcam")
+        return frame
+
+    def stop(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+
+class PiCamera2Wrapper:
+    def __init__(self):
+        from picamera2 import Picamera2
+
+        self.cam = Picamera2()
+        self.cam.configure(
+            self.cam.create_preview_configuration(
+                main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT)}
+            )
+        )
+        self.cam.start()
+        time.sleep(2)
+
+    def capture_array(self):
+        return self.cam.capture_array()
+
+    def stop(self):
+        self.cam.stop()
+
+
+def start_camera():
+    mode = choose_camera_mode()
+    print(f"Camera mode: {mode}")
+
+    if mode == "PI":
+        return PiCamera2Wrapper(), "RGB"
+
+    return WindowsOpenCVCamera(CAMERA_INDEX), "BGR"
+
 
 # ================= MQTT CALLBACKS =================
 def on_connect(client, userdata, flags, rc):
@@ -109,11 +197,11 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(TOPIC_ROBOT_STATUS)
         client.subscribe(TOPIC_ROBOT_SENSORS)
 
-        # Put robot into face follow mode
         client.publish(TOPIC_ROBOT_CMD, "MODE:1")
         client.publish(TOPIC_ROBOT_CMD, "STOP")
     else:
         print("MQTT connect failed:", rc)
+
 
 def on_message(client, userdata, msg):
     global last_status, last_sensors
@@ -122,7 +210,7 @@ def on_message(client, userdata, msg):
 
     try:
         data = json.loads(payload)
-    except:
+    except Exception:
         data = payload
 
     if msg.topic == TOPIC_ROBOT_STATUS:
@@ -132,13 +220,18 @@ def on_message(client, userdata, msg):
     elif msg.topic == TOPIC_ROBOT_SENSORS:
         last_sensors = data
 
-# ================= MQTT START =================
-client = mqtt.Client(client_id="luna-pi-face")
-client.on_connect = on_connect
-client.on_message = on_message
 
-client.connect(MQTT_BROKER, MQTT_PORT, 60)
-client.loop_start()
+def start_mqtt():
+    mqtt_client = mqtt.Client(client_id="luna-face-camera")
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+
+    print(f"Connecting MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.loop_start()
+
+    return mqtt_client
+
 
 # ================= ROBOT COMMAND =================
 def send_face_cmd(cmd):
@@ -149,36 +242,115 @@ def send_face_cmd(cmd):
         print("Face cmd:", cmd)
         last_cmd = cmd
 
-def detect_face(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    faces = face.detectMultiScale(gray, 1.1, 5)
+
+def detect_face(frame, color_mode, face_detector):
+    if color_mode == "RGB":
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        display_frame = frame
+
+    faces = face_detector.detectMultiScale(gray, 1.1, 5)
+
+    for (x, y, w, h) in faces:
+        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     if len(faces) == 0:
-        return "STOP"
+        return "STOP", display_frame
 
-    # Any face detected = tell ESP32 to stop rotating and move forward
-    return "FORWARD"
+    return "FORWARD", display_frame
 
-print("Pi AI started with MQTT")
-print("Face detected  -> MQTT luna/robot/cmd = FORWARD")
-print("No face        -> MQTT luna/robot/cmd = STOP")
 
-try:
-    while True:
-        frame = cam.capture_array()
+# ================= CLEAN EXIT =================
+def cleanup():
+    global client, camera, zeroconf, zeroconf_info
 
-        cmd = detect_face(frame)
-        send_face_cmd(cmd)
-
-        time.sleep(0.2)
-
-except KeyboardInterrupt:
     print("\nStopping...")
-    client.publish(TOPIC_ROBOT_CMD, "STOP")
-    time.sleep(0.2)
-    client.loop_stop()
-    client.disconnect()
-    cam.stop()
-    zeroconf.unregister_service(zeroconf_info)
-    zeroconf.close()
+
+    try:
+        if client:
+            client.publish(TOPIC_ROBOT_CMD, "STOP")
+            time.sleep(0.2)
+            client.loop_stop()
+            client.disconnect()
+    except Exception:
+        pass
+
+    try:
+        if camera:
+            camera.stop()
+    except Exception:
+        pass
+
+    try:
+        if zeroconf and zeroconf_info:
+            zeroconf.unregister_service(zeroconf_info)
+            zeroconf.close()
+    except Exception:
+        pass
+
     print("Stopped")
+
+
+def signal_handler(sig, frame):
+    cleanup()
+    sys.exit(0)
+
+
+# ================= MAIN =================
+def main():
+    global client, camera, zeroconf, zeroconf_info
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    print("Prometheus/LUNA face MQTT started")
+    print("Face detected -> MQTT luna/robot/cmd = FORWARD")
+    print("No face       -> MQTT luna/robot/cmd = STOP")
+
+    zeroconf, zeroconf_info = start_zeroconf()
+
+    client = start_mqtt()
+
+    cascade_path = get_haarcascade_path()
+    print("Using haarcascade:", cascade_path)
+
+    face_detector = cv2.CascadeClassifier(cascade_path)
+    if face_detector.empty():
+        raise RuntimeError("Failed to load face cascade")
+
+    camera, color_mode = start_camera()
+
+    print("Running. Press Ctrl+C to stop.")
+    print("Press Q in camera window to quit preview.")
+
+    try:
+        while True:
+            frame = camera.capture_array()
+
+            cmd, display_frame = detect_face(frame, color_mode, face_detector)
+            send_face_cmd(cmd)
+
+            cv2.putText(
+                display_frame,
+                f"CMD: {cmd}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+
+            cv2.imshow("Prometheus/LUNA Face MQTT", display_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+            time.sleep(0.2)
+
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()
