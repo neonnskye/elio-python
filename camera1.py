@@ -233,12 +233,20 @@ def start_mqtt():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
 
-    print(f"Connecting MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    mqtt_client.loop_start()
+    for broker in MQTT_BROKER_OPTIONS:
+        try:
+            print(f"Trying MQTT broker: {broker}:{MQTT_PORT}")
 
-    return mqtt_client
+            mqtt_client.connect(broker, MQTT_PORT, 60)
+            mqtt_client.loop_start()
 
+            print(f"Connected to MQTT broker: {broker}")
+            return mqtt_client
+
+        except Exception as e:
+            print(f"Failed: {broker} -> {e}")
+
+    raise RuntimeError("Could not connect to any MQTT broker")
 
 # ================= ROBOT COMMAND =================
 def send_face_cmd(cmd):
