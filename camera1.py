@@ -26,7 +26,14 @@ CAMERA_MODE = "AUTO"  # AUTO | WINDOWS | PI
 # If Mosquitto runs on the same machine as this Python script:
 #   Windows laptop test: 127.0.0.1
 #   Raspberry Pi final: 127.0.0.1
-MQTT_BROKER = "127.0.0.1"
+# ================= MQTT =================
+MQTT_BROKER_OPTIONS = [
+    "127.0.0.1",
+    "localhost",
+    "raspberrypi.local",
+    "10.158.207.160"
+]
+
 MQTT_PORT = 1883
 
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
