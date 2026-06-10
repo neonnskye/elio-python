@@ -1,9 +1,11 @@
 import collections
 import concurrent.futures
 import io
+import json
 import os
 import platform
 import queue
+import random
 import re
 import socket
 import sys
@@ -95,6 +97,58 @@ def _load_system_prompt() -> str:
 
 
 LLM_SYSTEM_PROMPT = _load_system_prompt()
+
+STORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stories.json")
+
+# Keywords that trigger the story-picker (case-insensitive)
+STORY_KEYWORDS = {"story", "stories", "tale", "tales"}
+
+
+def pick_random_story() -> dict | None:
+    """Pick a random story from stories.json.
+
+    Returns a dict with 'number', 'title', and 'description', or None if
+    the file is missing or malformed.
+    """
+    try:
+        with open(STORIES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        stories_list = data["stories"]
+        target_number = random.randint(1, len(stories_list))
+        for story in stories_list:
+            if story["number"] == target_number:
+                return story
+    except Exception as exc:
+        print(f"{ts()} [stories] Could not load stories.json: {exc}", flush=True)
+    return None
+
+
+def augment_story_prompt(transcript: str) -> str:
+    """If the transcript contains a story keyword, pick a random story and
+    inject a SYSTEM NOTE into the prompt so the LLM narrates that specific
+    story instead of making one up.
+
+    Returns the (possibly augmented) transcript string.
+    """
+    words = set(re.findall(r"[a-z]+", transcript.lower()))
+    if not words & STORY_KEYWORDS:
+        return transcript  # no story keyword — pass through unchanged
+
+    story = pick_random_story()
+    if story is None:
+        return transcript  # couldn't load stories, fall back to default behaviour
+
+    note = (
+        f" [SYSTEM NOTE: The system has randomly selected the following story for "
+        f'this request. Please narrate it: "{story["title"]}" — {story["description"]}]'
+    )
+    print(
+        f"{ts()} [stories] Story keyword detected. Selected #{story['number']}: "
+        f"{story['title']}",
+        flush=True,
+    )
+    return transcript + note
+
 
 # VAD / segmentation config
 VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
@@ -610,18 +664,31 @@ def llm_loop() -> None:
         tts_queued = False
         timed_out = False
 
-        # Append user transcript to conversation history
+        # Augment story requests with a randomly selected story before sending to
+        # the LLM.  We store only the original transcript in history so the
+        # SYSTEM NOTE doesn't pollute future turns.
+        llm_transcript = augment_story_prompt(transcript)
+
+        # Append the original (unaugmented) user transcript to conversation history
         with history_lock:
             conversation_history.append({"role": "user", "content": transcript})
 
         try:
-            print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
+            print(
+                f"{ts()} [LLM] Sending to {LLM_MODEL}: {llm_transcript!r}", flush=True
+            )
+            # Build messages: history with the last user turn replaced by the
+            # (possibly augmented) transcript so the SYSTEM NOTE reaches the LLM.
+            with history_lock:
+                messages_snapshot = list(conversation_history)
+            # Replace the last entry (just-appended user turn) with the augmented one
+            messages_snapshot[-1] = {"role": "user", "content": llm_transcript}
             stream = llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": LLM_SYSTEM_PROMPT},
                 ]
-                + conversation_history,
+                + messages_snapshot,
                 stream=True,
             )
 
@@ -924,7 +991,7 @@ def synthesize_text(text: str) -> np.ndarray:
     if peak > 0:
         pcm_resampled = pcm_resampled / peak
 
-    pcm_int16 = (pcm_resampled * 0.7 * 32767).clip(-32768, 32767).astype(np.int16)
+    pcm_int16 = (pcm_resampled * 0.6 * 32767).clip(-32768, 32767).astype(np.int16)
     return pcm_int16
 
 
