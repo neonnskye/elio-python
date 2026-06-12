@@ -7,26 +7,14 @@ import signal
 import sys
 import paho.mqtt.client as mqtt
 
-# ================= OPTIONAL ZEROCONF / mDNS =================
-# Install on Windows if needed:
-#   pip install zeroconf
 try:
     from zeroconf import ServiceInfo, Zeroconf
     ZEROCONF_AVAILABLE = True
 except Exception:
     ZEROCONF_AVAILABLE = False
 
-# ================= SYSTEM MODE =================
-# AUTO:
-#   Windows laptop -> OpenCV webcam
-#   Raspberry Pi   -> Picamera2
-CAMERA_MODE = "AUTO"  # AUTO | WINDOWS | PI
+CAMERA_MODE = "AUTO"
 
-# ================= MQTT =================
-# If Mosquitto runs on the same machine as this Python script:
-#   Windows laptop test: 127.0.0.1
-#   Raspberry Pi final: 127.0.0.1
-# ================= MQTT =================
 MQTT_BROKER_OPTIONS = [
     "127.0.0.1",
     "localhost",
@@ -40,12 +28,19 @@ TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_STATUS = "luna/robot/status"
 TOPIC_ROBOT_SENSORS = "luna/robot/sensors"
 
-# ================= CAMERA SETTINGS =================
 CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
 CAMERA_INDEX = 0
 
-# ================= FACE DETECTION =================
+last_cmd = ""
+last_status = {}
+last_sensors = {}
+client = None
+camera = None
+zeroconf = None
+zeroconf_info = None
+
+
 def get_haarcascade_path():
     p1 = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     p2 = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
@@ -65,17 +60,6 @@ def get_haarcascade_path():
     raise FileNotFoundError("Cannot find haarcascade_frontalface_default.xml")
 
 
-# ================= GLOBALS =================
-last_cmd = ""
-last_status = {}
-last_sensors = {}
-client = None
-camera = None
-zeroconf = None
-zeroconf_info = None
-
-
-# ================= mDNS HELPERS =================
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -88,10 +72,8 @@ def get_local_ip():
 
 
 def start_zeroconf():
-    """Advertise MQTT service as raspberrypi.local."""
     if not ZEROCONF_AVAILABLE:
-        print("Zeroconf not installed. mDNS advertise skipped.")
-        print("Install with: pip install zeroconf")
+        print("Zeroconf not installed. mDNS skipped.")
         return None, None
 
     local_ip = get_local_ip()
@@ -113,11 +95,10 @@ def start_zeroconf():
     zc = Zeroconf()
     zc.register_service(info)
 
-    print(f"mDNS/Zeroconf advertised: raspberrypi.local -> {local_ip}:{MQTT_PORT}")
+    print(f"mDNS advertised: raspberrypi.local -> {local_ip}:{MQTT_PORT}")
     return zc, info
 
 
-# ================= CAMERA HELPERS =================
 def is_raspberry_pi():
     if platform.system().lower() != "linux":
         return False
@@ -164,7 +145,6 @@ class WindowsOpenCVCamera:
 
     def stop(self):
         self.cap.release()
-        cv2.destroyAllWindows()
 
 
 class PiCamera2Wrapper:
@@ -197,15 +177,17 @@ def start_camera():
     return WindowsOpenCVCamera(CAMERA_INDEX), "BGR"
 
 
-# ================= MQTT CALLBACKS =================
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("MQTT connected")
+
         client.subscribe(TOPIC_ROBOT_STATUS)
         client.subscribe(TOPIC_ROBOT_SENSORS)
 
         client.publish(TOPIC_ROBOT_CMD, "MODE:1")
+        time.sleep(0.1)
         client.publish(TOPIC_ROBOT_CMD, "STOP")
+
     else:
         print("MQTT connect failed:", rc)
 
@@ -236,7 +218,6 @@ def start_mqtt():
     for broker in MQTT_BROKER_OPTIONS:
         try:
             print(f"Trying MQTT broker: {broker}:{MQTT_PORT}")
-
             mqtt_client.connect(broker, MQTT_PORT, 60)
             mqtt_client.loop_start()
 
@@ -248,7 +229,7 @@ def start_mqtt():
 
     raise RuntimeError("Could not connect to any MQTT broker")
 
-# ================= ROBOT COMMAND =================
+
 def send_face_cmd(cmd):
     global last_cmd
 
@@ -261,23 +242,22 @@ def send_face_cmd(cmd):
 def detect_face(frame, color_mode, face_detector):
     if color_mode == "RGB":
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     else:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        display_frame = frame
 
-    faces = face_detector.detectMultiScale(gray, 1.1, 5)
-
-    for (x, y, w, h) in faces:
-        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    faces = face_detector.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(40, 40)
+    )
 
     if len(faces) == 0:
-        return "STOP", display_frame
+        return "STOP"
 
-    return "FORWARD", display_frame
+    return "FORWARD"
 
 
-# ================= CLEAN EXIT =================
 def cleanup():
     global client, camera, zeroconf, zeroconf_info
 
@@ -313,15 +293,15 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-# ================= MAIN =================
 def main():
     global client, camera, zeroconf, zeroconf_info
 
     signal.signal(signal.SIGINT, signal_handler)
 
     print("Prometheus/LUNA face MQTT started")
-    print("Face detected -> MQTT luna/robot/cmd = FORWARD")
-    print("No face       -> MQTT luna/robot/cmd = STOP")
+    print("Face detected -> FORWARD")
+    print("No face       -> STOP")
+    print("No camera live preview enabled")
 
     zeroconf, zeroconf_info = start_zeroconf()
 
@@ -331,35 +311,20 @@ def main():
     print("Using haarcascade:", cascade_path)
 
     face_detector = cv2.CascadeClassifier(cascade_path)
+
     if face_detector.empty():
         raise RuntimeError("Failed to load face cascade")
 
     camera, color_mode = start_camera()
 
     print("Running. Press Ctrl+C to stop.")
-    print("Press Q in camera window to quit preview.")
 
     try:
         while True:
             frame = camera.capture_array()
 
-            cmd, display_frame = detect_face(frame, color_mode, face_detector)
+            cmd = detect_face(frame, color_mode, face_detector)
             send_face_cmd(cmd)
-
-            cv2.putText(
-                display_frame,
-                f"CMD: {cmd}",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-
-            cv2.imshow("Prometheus/LUNA Face MQTT", display_frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
 
             time.sleep(0.2)
 
