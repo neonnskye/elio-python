@@ -1,0 +1,129 @@
+{
+  "stories": [
+    {
+      "number": 1,
+      "title": "Cinderella",
+      "description": "A kind girl mistreated by her stepfamily attends a royal ball with magical help, loses her glass slipper, and is found by the prince who marries her."
+    },
+    {
+      "number": 2,
+      "title": "Little Red Riding Hood",
+      "description": "A young girl on her way to Grandma's house is tricked by a wolf who eats her grandmother, then tries to eat her too, until a woodsman cuts them free."
+    },
+    {
+      "number": 3,
+      "title": "Sleeping Beauty",
+      "description": "A princess cursed to prick her finger on a spindle and die instead falls into a deep sleep, awakened only by true love's kiss after a hundred years."
+    },
+    {
+      "number": 4,
+      "title": "Snow White",
+      "description": "A beautiful princess flees from her jealous stepmother the queen, lives with seven dwarfs, eats a poisoned apple, and is revived by a prince's kiss."
+    },
+    {
+      "number": 5,
+      "title": "The Tortoise and the Hare",
+      "description": "An overconfident fast rabbit loses a race to a slow, steady tortoise who never stops moving."
+    },
+    {
+      "number": 6,
+      "title": "The Boy Who Cried Wolf",
+      "description": "A shepherd boy repeatedly tricks villagers into thinking a wolf is attacking, so when a real wolf comes, nobody believes him and his flock is eaten."
+    },
+    {
+      "number": 7,
+      "title": "King Midas",
+      "description": "A greedy king wishes that everything he touches turns to gold, only to discover he can't eat or hug his daughter, and begs to reverse the curse."
+    },
+    {
+      "number": 8,
+      "title": "Theseus and the Minotaur",
+      "description": "A prince volunteers to enter a labyrinth and slays the half-man, half-bull monster, then finds his way out using a ball of thread."
+    },
+    {
+      "number": 9,
+      "title": "Pandora's Box",
+      "description": "The first woman opens a forbidden box, releasing all the evils of the world, but only Hope remains inside to comfort humanity."
+    },
+    {
+      "number": 10,
+      "title": "The Ugly Duckling",
+      "description": "An outcast duckling endures mockery for looking different, only to grow into a beautiful swan."
+    },
+    {
+      "number": 11,
+      "title": "Jack and the Beanstalk",
+      "description": "A boy trades a cow for magic beans that grow into a giant beanstalk; he climbs it, steals treasure from a giant, and chops the stalk down."
+    },
+    {
+      "number": 12,
+      "title": "Rapunzel",
+      "description": "A girl with impossibly long hair is locked in a tower; a prince climbs her hair to visit her until a witch cuts it and banishes them both, but they reunite."
+    },
+    {
+      "number": 13,
+      "title": "The Princess and the Pea",
+      "description": "A queen tests a so-called princess by placing a pea under twenty mattresses; the princess's sensitivity proves her royal blood."
+    },
+    {
+      "number": 14,
+      "title": "Hansel and Gretel",
+      "description": "Two children lost in a forest find a house made of candy owned by a witch who tries to eat them, but they push her into her own oven."
+    },
+    {
+      "number": 15,
+      "title": "The Three Little Pigs",
+      "description": "Three pigs build houses of straw, sticks, and bricks; a wolf blows down the first two but fails against the brick house."
+    },
+    {
+      "number": 16,
+      "title": "Goldilocks and the Three Bears",
+      "description": "A girl enters a bear family's home, eats their porridge, sits in their chairs, sleeps in a bed, and flees when the bears return."
+    },
+    {
+      "number": 17,
+      "title": "The Elves and the Shoemaker",
+      "description": "A poor shoemaker and his wife wake up to find beautiful shoes made overnight by secret elves, so they sew the elves tiny clothes as thanks."
+    },
+    {
+      "number": 18,
+      "title": "Puss in Boots",
+      "description": "A clever cat secures wealth and a castle for his poor master by tricking an ogre and a king through cunning disguises."
+    },
+    {
+      "number": 19,
+      "title": "Beauty and the Beast",
+      "description": "A young woman agrees to live with a monstrous beast to save her father, learns to love him, and breaks a spell that turns him into a handsome prince."
+    },
+    {
+      "number": 20,
+      "title": "Aladdin and the Wonderful Lamp",
+      "description": "A poor boy rubs a magic lamp containing a genie who grants wishes, helping him win a princess and defeat an evil sorcerer."
+    },
+    {
+      "number": 21,
+      "title": "The Twelve Dancing Princesses",
+      "description": "A soldier solves the mystery of why twelve princesses wake up with worn-out shoes each morning—they secretly go dancing all night."
+    },
+    {
+      "number": 22,
+      "title": "The Pied Piper of Hamelin",
+      "description": "A piper lures away a town's rats with magic music, and when not paid, he lures away the children as well."
+    },
+    {
+      "number": 23,
+      "title": "The Lion and the Mouse",
+      "description": "A mouse spares a lion who later frees the mouse from a trap; the mouse then gnaws through ropes to save the lion's life."
+    },
+    {
+      "number": 24,
+      "title": "The Goose that Laid the Golden Eggs",
+      "description": "A farmer kills his goose to get all the gold eggs inside at once, only to find nothing and lose the golden eggs forever."
+    },
+    {
+      "number": 25,
+      "title": "Mulan",
+      "description": "A young woman disguises herself as a man to take her aging father's place in the army, wins battles with her wits, and brings honor to her family."
+    }
+  ]
+}

@@ -1,9 +1,11 @@
 import collections
 import concurrent.futures
 import io
+import json
 import os
 import platform
 import queue
+import random
 import re
 import socket
 import sys
@@ -96,6 +98,116 @@ def _load_system_prompt() -> str:
 
 LLM_SYSTEM_PROMPT = _load_system_prompt()
 
+STORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stories.json")
+
+# Keywords that trigger the story-picker (case-insensitive)
+STORY_KEYWORDS = {"story", "stories", "tale", "tales"}
+
+# ---- Robot command dispatch ----
+# Each entry is (frozenset_of_required_words, mqtt_payload).
+# Checked in order; first match wins.  The transcript must contain ALL words in
+# the set (order-independent, case-insensitive) to trigger the command.
+# Triggering a command also sends "MODE-2" first to ensure manual mode is active,
+# then skips forwarding the transcript to the LLM.
+ROBOT_COMMANDS: list[tuple[frozenset, str]] = [
+    # --- Movement ---
+    (frozenset({"go", "forward"}), "MANUAL:FORWARD"),
+    (frozenset({"move", "forward"}), "MANUAL:FORWARD"),
+    (frozenset({"go", "back"}), "MANUAL:BACKWARD"),
+    (frozenset({"move", "back"}), "MANUAL:BACKWARD"),
+    (frozenset({"go", "backward"}), "MANUAL:BACKWARD"),
+    (frozenset({"move", "backward"}), "MANUAL:BACKWARD"),
+    (frozenset({"go", "reverse"}), "MANUAL:BACKWARD"),
+    (frozenset({"turn", "left"}), "MANUAL:LEFT"),
+    (frozenset({"go", "left"}), "MANUAL:LEFT"),
+    (frozenset({"turn", "right"}), "MANUAL:RIGHT"),
+    (frozenset({"go", "right"}), "MANUAL:RIGHT"),
+    (frozenset({"stop"}), "MANUAL:STOP"),
+    (frozenset({"halt"}), "MANUAL:STOP"),
+    (frozenset({"freeze"}), "MANUAL:STOP"),
+    # --- Dance ---
+    (frozenset({"dance", "one"}), "DANCE:1"),
+    (frozenset({"dance", "1"}), "DANCE:1"),
+    (frozenset({"dance", "first"}), "DANCE:1"),
+    (frozenset({"dance", "two"}), "DANCE:2"),
+    (frozenset({"dance", "2"}), "DANCE:2"),
+    (frozenset({"dance", "second"}), "DANCE:2"),
+    (frozenset({"dance", "three"}), "DANCE:3"),
+    (frozenset({"dance", "3"}), "DANCE:3"),
+    (frozenset({"dance", "third"}), "DANCE:3"),
+]
+
+
+def check_for_robot_command(text: str) -> str | None:
+    """Check whether *text* matches any entry in ROBOT_COMMANDS.
+
+    Returns the MQTT payload string (e.g. 'MANUAL:FORWARD') if a match is
+    found, or None if the transcript should be forwarded to the LLM as usual.
+    """
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    for required_words, payload in ROBOT_COMMANDS:
+        if required_words.issubset(words):
+            return payload
+    return None
+
+
+def dispatch_robot_command(payload: str) -> None:
+    """Set the robot to manual mode then publish the movement/dance command."""
+    mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+    time.sleep(0.05)  # small gap so the motor controller processes mode switch first
+    mqtt_publish(TOPIC_ROBOT_CMD, payload)
+    print(f"{ts()} [CMD] Robot command dispatched -> {payload}", flush=True)
+
+
+# --------------------------------
+
+
+def pick_random_story() -> dict | None:
+    """Pick a random story from stories.json.
+
+    Returns a dict with 'number', 'title', and 'description', or None if
+    the file is missing or malformed.
+    """
+    try:
+        with open(STORIES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        stories_list = data["stories"]
+        target_number = random.randint(1, len(stories_list))
+        for story in stories_list:
+            if story["number"] == target_number:
+                return story
+    except Exception as exc:
+        print(f"{ts()} [stories] Could not load stories.json: {exc}", flush=True)
+    return None
+
+
+def augment_story_prompt(transcript: str) -> str:
+    """If the transcript contains a story keyword, pick a random story and
+    inject a SYSTEM NOTE into the prompt so the LLM narrates that specific
+    story instead of making one up.
+
+    Returns the (possibly augmented) transcript string.
+    """
+    words = set(re.findall(r"[a-z]+", transcript.lower()))
+    if not words & STORY_KEYWORDS:
+        return transcript  # no story keyword — pass through unchanged
+
+    story = pick_random_story()
+    if story is None:
+        return transcript  # couldn't load stories, fall back to default behaviour
+
+    note = (
+        f" [SYSTEM NOTE: The system has randomly selected the following story for "
+        f'this request. Please narrate it: "{story["title"]}" — {story["description"]}]'
+    )
+    print(
+        f"{ts()} [stories] Story keyword detected. Selected #{story['number']}: "
+        f"{story['title']}",
+        flush=True,
+    )
+    return transcript + note
+
+
 # VAD / segmentation config
 VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
 VAD_MIN_SPEECH_MS = 400  # ignore speech segments shorter than this
@@ -119,6 +231,12 @@ MQTT_BROKER = "127.0.0.1"  # broker runs locally
 MQTT_PORT = 1883
 TOPIC_WAKE = "elio/wake"
 TOPIC_CTRL = "elio/ctrl"
+TOPIC_STATE = "elio/state"
+TOPIC_TRANSCRIPT_USER = "elio/transcript/user"
+TOPIC_TRANSCRIPT_ASST = "elio/transcript/assistant"
+TOPIC_SYSTEM_READY = "elio/system/ready"
+TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
+TOPIC_ROBOT_CMD = "luna/robot/cmd"
 
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
@@ -344,6 +462,8 @@ def on_mqtt_message(client, userdata, msg) -> None:
         listen_state = ListenState.SKIP_WAKEWORD_BLEED
         bleed_remaining = BLEED_SKIP_PACKETS
 
+    mqtt_publish(TOPIC_STATE, "listening")
+
     print(
         f"\n{ts()} [WAKE] Wake word received via MQTT! "
         f"Skipping {BLEED_SKIP_PACKETS} packets of bleed..."
@@ -438,6 +558,7 @@ def vad_accumulator_loop() -> None:
                     )
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
+                    mqtt_publish(TOPIC_STATE, "transcribing")
                     transcribe_queue.put(segment)
                     # Turn off the listen LED — user has finished speaking.
                     # 0x03 doubles as chime-stop; at this point the chime loop
@@ -531,16 +652,26 @@ def transcription_loop() -> None:
         text = result_holder.get("text", "").strip()
         if text:
             print(f"{ts()} [STT] {stt_elapsed:.2f}s → {text}")
+            mqtt_publish(TOPIC_TRANSCRIPT_USER, text)
             word_count = len(text.split())
-            if word_count <= 3:
+            if word_count <= 2:
                 print(
                     f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
                 )
                 reset_to_idle("transcript too short")
             else:
-                with state_lock:
-                    listen_state = ListenState.RESPONDING
-                llm_queue.put(text)
+                # --- Robot command intercept ---
+                # Check before forwarding to the LLM; matched commands are
+                # dispatched directly and bypass the LLM entirely.
+                robot_cmd = check_for_robot_command(text)
+                if robot_cmd is not None:
+                    dispatch_robot_command(robot_cmd)
+                    reset_to_idle("robot command handled")
+                else:
+                    with state_lock:
+                        listen_state = ListenState.RESPONDING
+                    mqtt_publish(TOPIC_STATE, "thinking")
+                    llm_queue.put(text)
         else:
             reset_to_idle("empty transcript")
 
@@ -600,18 +731,31 @@ def llm_loop() -> None:
         tts_queued = False
         timed_out = False
 
-        # Append user transcript to conversation history
+        # Augment story requests with a randomly selected story before sending to
+        # the LLM.  We store only the original transcript in history so the
+        # SYSTEM NOTE doesn't pollute future turns.
+        llm_transcript = augment_story_prompt(transcript)
+
+        # Append the original (unaugmented) user transcript to conversation history
         with history_lock:
             conversation_history.append({"role": "user", "content": transcript})
 
         try:
-            print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
+            print(
+                f"{ts()} [LLM] Sending to {LLM_MODEL}: {llm_transcript!r}", flush=True
+            )
+            # Build messages: history with the last user turn replaced by the
+            # (possibly augmented) transcript so the SYSTEM NOTE reaches the LLM.
+            with history_lock:
+                messages_snapshot = list(conversation_history)
+            # Replace the last entry (just-appended user turn) with the augmented one
+            messages_snapshot[-1] = {"role": "user", "content": llm_transcript}
             stream = llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": LLM_SYSTEM_PROMPT},
                 ]
-                + conversation_history,
+                + messages_snapshot,
                 stream=True,
             )
 
@@ -703,6 +847,8 @@ def llm_loop() -> None:
                     print(
                         f"{ts()} [LLM] History: {len(conversation_history)} messages stored."
                     )
+                    if collected:
+                        mqtt_publish(TOPIC_TRANSCRIPT_ASST, collected)
 
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
@@ -760,6 +906,17 @@ def mqtt_send_ctrl(payload: str) -> None:
         print(f"{ts()} [CTRL] MQTT publish failed ({payload!r}): {exc}", flush=True)
 
 
+def mqtt_publish(topic: str, payload: str) -> None:
+    if not mqtt_client.is_connected():
+        return
+    try:
+        mqtt_client.publish(topic, payload)
+    except Exception as exc:
+        print(
+            f"{ts()} [MQTT] Publish failed ({topic!r} {payload!r}): {exc}", flush=True
+        )
+
+
 def reset_to_idle(reason: str = "") -> None:
     """
     Reset Python state and always tell ESP32 to turn off LED/chime.
@@ -786,6 +943,7 @@ def reset_to_idle(reason: str = "") -> None:
 
     with state_lock:
         listen_state = ListenState.IDLE
+    mqtt_publish(TOPIC_STATE, "idle")
 
     if reason:
         print(f"{ts()} [STATE] Reset to IDLE: {reason}")
@@ -900,7 +1058,7 @@ def synthesize_text(text: str) -> np.ndarray:
     if peak > 0:
         pcm_resampled = pcm_resampled / peak
 
-    pcm_int16 = (pcm_resampled * 0.5 * 32767).clip(-32768, 32767).astype(np.int16)
+    pcm_int16 = (pcm_resampled * 0.6 * 32767).clip(-32768, 32767).astype(np.int16)
     return pcm_int16
 
 
@@ -1017,6 +1175,7 @@ def audio_dispatch_loop() -> None:
                 )  # drain delay: let ESP32 I2S DMA finish playing last packet
                 reset_to_idle("ESP32 playback finished")
             else:
+                mqtt_publish(TOPIC_STATE, "speaking")
                 play_audio(item)
         audio_queue_event.clear()
 
@@ -1241,6 +1400,7 @@ def main() -> None:
             break
         time.sleep(0.01)
 
+    mqtt_publish(TOPIC_SYSTEM_READY, "1")
     print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
@@ -1258,6 +1418,7 @@ def main() -> None:
         shutdown_event.set()
 
         # Tell ESP32 to turn off LED / stop chime
+        mqtt_publish(TOPIC_SYSTEM_SHUTDOWN, "1")
         mqtt_send_ctrl("stop")
         mqtt_client.loop_stop()
         mqtt_client.disconnect()

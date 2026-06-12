@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# split_wav.sh
-# Splits all WAV files in a directory into 1-second clips, placed in a clips/ subfolder.
-# Usage: ./split_wav.sh [directory]
+# data_prep.sh
+# Converts all audio files in a directory to 16 kHz mono PCM WAV, then optionally
+# splits them into 1-second clips placed in a clips/ subfolder.
+# Supported formats: wav, mp3, m4a, ogg, flac, aac, opus, wma, mkv, mp4, webm
+# Usage: ./data_prep.sh [directory]
 #   directory: optional, defaults to current directory
 
 RAW_DIR="${1:-.}"
@@ -34,40 +36,45 @@ CLIPS_DIR="$TARGET_DIR/clips"
 RAW_BACKUP_DIR="$TARGET_DIR/raw"
 
 shopt -s nullglob
-WAV_FILES=("$TARGET_DIR"/*.wav)
+AUDIO_EXTENSIONS=(wav mp3 m4a ogg flac aac opus wma mkv mp4 webm)
+AUDIO_FILES=()
+for ext in "${AUDIO_EXTENSIONS[@]}"; do
+    AUDIO_FILES+=("$TARGET_DIR"/*."$ext")
+done
 
-if [ ${#WAV_FILES[@]} -eq 0 ]; then
-    echo "No WAV files found in '$TARGET_DIR'"
+if [ ${#AUDIO_FILES[@]} -eq 0 ]; then
+    echo "No audio files found in '$TARGET_DIR'"
     exit 1
 fi
 
-echo "Found ${#WAV_FILES[@]} WAV file(s)."
+echo "Found ${#AUDIO_FILES[@]} audio file(s)."
 echo "-------------------------------------------"
 
 # --------------------------------------------------
-# Step 0: Convert all files to 16 kHz mono PCM
+# Step 0: Convert all audio files to 16 kHz mono PCM WAV
 # --------------------------------------------------
 echo ""
-echo "[0/5] Converting to 16 kHz mono PCM..."
+echo "[0/5] Converting to 16 kHz mono PCM WAV..."
 mkdir -p "$RAW_BACKUP_DIR"
-for f in "${WAV_FILES[@]}"; do
+for f in "${AUDIO_FILES[@]}"; do
     filename=$(basename "$f")
-    echo "      Resampling: $filename"
-    ffmpeg -v error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$TARGET_DIR/resampled_$filename"
+    base="${filename%.*}"   # strip any extension
+    echo "      Converting: $filename"
+    ffmpeg -v error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$TARGET_DIR/converted_${base}.wav"
 done
 
-# Move original files to raw/ backup (only the pre-conversion files, not the resampled_ ones)
+# Move original files to raw/ backup
 echo "      Moving originals to raw/..."
-for f in "${WAV_FILES[@]}"; do
+for f in "${AUDIO_FILES[@]}"; do
     mv "$f" "$RAW_BACKUP_DIR/"
 done
 
-# Rename resampled files to original names (remove "resampled_" prefix)
-for f in "$TARGET_DIR"/resampled_*.wav; do
-    mv "$f" "${f//resampled_/}"
+# Rename converted files to clean names (remove "converted_" prefix)
+for f in "$TARGET_DIR"/converted_*.wav; do
+    mv "$f" "$TARGET_DIR/${f##*/converted_}"
 done
 
-# Re-populate WAV_FILES with the converted files
+# Populate WAV_FILES with the converted files for the rest of the pipeline
 WAV_FILES=("$TARGET_DIR"/*.wav)
 echo "      Done."
 echo "-------------------------------------------"
