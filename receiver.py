@@ -15,7 +15,6 @@ import wave
 from datetime import datetime
 from enum import Enum, auto
 from math import gcd
-from pathlib import Path
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -408,27 +407,18 @@ vad_model = None
 
 
 def load_silero_vad() -> None:
-    """Load the Silero VAD model from the local models directory."""
+    """Load the Silero VAD model at startup."""
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
-
-    # Define the local path to your VAD model directory
-    local_vad_path = Path(__file__).parent / "models" / "silero-vad"
-
-    if not local_vad_path.exists():
-        raise FileNotFoundError(f"VAD model directory not found at {local_vad_path}")
-
-    # Load using source="local"
     model, _ = torch.hub.load(
-        repo_or_dir=str(local_vad_path),
+        repo_or_dir="snakers4/silero-vad",
         model="silero_vad",
-        source="local",  # Tells PyTorch to look at the local disk, not GitHub
+        force_reload=False,
         trust_repo=True,
     )
-
     model.eval()
     vad_model = model
-    print(f"{ts()} Silero VAD model loaded from local directory.", flush=True)
+    print(f"{ts()} Silero VAD model loaded.", flush=True)
 
 
 _last_wake_time: float = 0.0
