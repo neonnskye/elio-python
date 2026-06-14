@@ -46,7 +46,7 @@ def get_llm_context() -> str:
     return (
         "User is currently located at the Faculty of Information Technology, "
         "University of Moratuwa, Katubedda, Sri Lanka.\n"
-        f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Current time: {current_time.strftime('%A, %B %d %Y, %I:%M %p')}\n"
         f"Weather: {current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
         f"humidity {current_relative_humidity:.0f}%{precip_str}{rain_str}"
     )
