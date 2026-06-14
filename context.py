@@ -17,6 +17,7 @@ params = {
         "relative_humidity_2m",
         "apparent_temperature",
         "precipitation",
+        "rain",
     ],
     "timezone": "Asia/Colombo",
 }
@@ -29,6 +30,7 @@ current_temperature_2m = current.Variables(0).Value()
 current_relative_humidity = current.Variables(1).Value()
 current_apparent_temp = current.Variables(2).Value()
 current_precipitation = current.Variables(3).Value()
+current_rain = current.Variables(4).Value()
 
 current_time = datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
@@ -40,12 +42,13 @@ def get_llm_context() -> str:
         if current_precipitation > 0
         else ""
     )
+    rain_str = f", rain {current_rain:.1f} mm" if current_rain > 0 else ""
     return (
         "User is currently located at the Faculty of Information Technology, "
         "University of Moratuwa, Katubedda, Sri Lanka.\n"
         f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Weather: {current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
-        f"humidity {current_relative_humidity:.0f}%{precip_str}"
+        f"humidity {current_relative_humidity:.0f}%{precip_str}{rain_str}"
     )
 
 
