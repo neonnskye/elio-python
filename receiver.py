@@ -105,6 +105,8 @@ STORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stories
 STORY_KEYWORDS = {"story", "stories", "tale", "tales"}
 
 # ---- Robot command dispatch ----
+# DEPRECATED: keyword-based command dispatch replaced by LLM CMD tag protocol.
+# These are kept for reference and can be removed once the new system is validated.
 # Each entry is (frozenset_of_required_words, mqtt_payload).
 # Checked in order; first match wins.  The transcript must contain ALL words in
 # the set (order-independent, case-insensitive) to trigger the command.
@@ -158,6 +160,40 @@ def dispatch_robot_command(payload: str) -> None:
     time.sleep(0.05)  # small gap so the motor controller processes mode switch first
     mqtt_publish(TOPIC_ROBOT_CMD, payload)
     print(f"{ts()} [CMD] Robot command dispatched -> {payload}", flush=True)
+
+
+# Matches [CMD:PAYLOAD] tags emitted by the LLM (e.g. [CMD:MANUAL:FORWARD])
+_CMD_TAG_RE = re.compile(r"\[CMD:([A-Z0-9_:]+)\]", re.IGNORECASE)
+
+
+def extract_and_dispatch_cmd(text: str) -> str:
+    """Scan *text* for a [CMD:PAYLOAD] tag emitted by the LLM.
+
+    If found:
+    - Dispatches the command via MQTT (MODE-2 first for MANUAL commands).
+    - Returns the text with the tag stripped (so TTS never speaks it).
+
+    If not found, returns text unchanged.
+    Only the first tag is acted on; subsequent tags (if any) are also stripped silently.
+    """
+    tags = _CMD_TAG_RE.findall(text)
+    clean = _CMD_TAG_RE.sub("", text).strip()
+
+    for i, payload in enumerate(tags):
+        payload = payload.upper()
+        if i == 0:
+            # Only dispatch the first tag
+            if payload.startswith("MANUAL:"):
+                mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+                time.sleep(0.05)
+                mqtt_publish(TOPIC_ROBOT_CMD, payload)
+            else:
+                mqtt_publish(TOPIC_ROBOT_CMD, payload)
+            print(f"{ts()} [CMD] LLM command dispatched -> {payload}", flush=True)
+        else:
+            print(f"{ts()} [CMD] Extra tag ignored -> {payload}", flush=True)
+
+    return clean
 
 
 # --------------------------------
@@ -652,18 +688,10 @@ def transcription_loop() -> None:
                 )
                 reset_to_idle("transcript too short")
             else:
-                # --- Robot command intercept ---
-                # Check before forwarding to the LLM; matched commands are
-                # dispatched directly and bypass the LLM entirely.
-                robot_cmd = check_for_robot_command(text)
-                if robot_cmd is not None:
-                    dispatch_robot_command(robot_cmd)
-                    reset_to_idle("robot command handled")
-                else:
-                    with state_lock:
-                        listen_state = ListenState.RESPONDING
-                    mqtt_publish(TOPIC_STATE, "thinking")
-                    llm_queue.put(text)
+                with state_lock:
+                    listen_state = ListenState.RESPONDING
+                mqtt_publish(TOPIC_STATE, "thinking")
+                llm_queue.put(text)
         else:
             reset_to_idle("empty transcript")
 
@@ -792,6 +820,7 @@ def llm_loop() -> None:
                     sentences, buffer = split_sentences(buffer)
                     for sentence in sentences:
                         clean = strip_markdown(sentence).strip()
+                        clean = extract_and_dispatch_cmd(clean)
                         if clean:
                             tts_queue.put(clean)
                             tts_queued = True
@@ -810,6 +839,7 @@ def llm_loop() -> None:
             # Flush any remaining text in the buffer as a final sentence
             if buffer.strip():
                 clean = strip_markdown(buffer).strip()
+                clean = extract_and_dispatch_cmd(clean)
                 if clean:
                     tts_queue.put(clean)
                     tts_queued = True
