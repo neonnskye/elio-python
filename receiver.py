@@ -280,97 +280,91 @@ BLEED_SKIP_PACKETS = (
 )
 
 
-def resolve_mdns(hostname: str, timeout: int = 15) -> str:
-    """Resolve a .local mDNS hostname to an IP address.
+def resolve_mdns(hostname: str, retry_interval: float = 2.0) -> str:
+    """Resolve a .local mDNS hostname to an IP address via zeroconf.
 
-    Uses zeroconf directly to bypass the OS resolver (avahi NSS / Bonjour),
-    which can block for 3-8 seconds on a cold cache. The zeroconf path sends
-    a raw multicast A-record query and polls the response cache at 50ms
-    intervals, typically resolving in under 500ms.
+    Sends a raw multicast A-record query and polls the response cache at 50ms
+    intervals.  Retries indefinitely every `retry_interval` seconds until the
+    host responds — this is intentional: if the ESP32 isn't up yet, we wait
+    for it rather than crashing.
 
-    Falls back to socket.getaddrinfo() (with a 3s per-attempt thread timeout)
-    if zeroconf is unavailable.
+    On Raspberry Pi, avahi-daemon handles .local names at the OS level, but
+    going through zeroconf directly is faster (no NSS round-trip) and more
+    reliable across platforms.
     """
+    from zeroconf import Zeroconf
+    from zeroconf._dns import DNSAddress, DNSQuestion
+    from zeroconf._protocol.outgoing import DNSOutgoing
+    from zeroconf.const import _CLASS_IN, _TYPE_A
+
     fqdn = hostname if hostname.endswith(".local") else f"{hostname}.local"
     # zeroconf cache keys always include the trailing dot
     fqdn_dot = fqdn if fqdn.endswith(".") else fqdn + "."
-    print(f"{ts()} Resolving {fqdn} via mDNS...", flush=True)
-    t0 = time.monotonic()
 
-    # --- Fast path: direct zeroconf A-record query ---
-    # Stable import locations for modern zeroconf (0.32+):
-    #   - _TYPE_A / _CLASS_IN  -> zeroconf.const
-    #   - DNSOutgoing          -> zeroconf._protocol.outgoing
-    #   - DNSAddress / DNSQuestion -> zeroconf._dns
-    # Older versions exported these from the top-level package; those were
-    # removed, hence the ImportError you saw.
-    try:
-        from zeroconf import Zeroconf
-        from zeroconf._dns import DNSAddress, DNSQuestion
-        from zeroconf._protocol.outgoing import DNSOutgoing
-        from zeroconf.const import _CLASS_IN, _TYPE_A
-
+    attempt = 0
+    while not shutdown_event.is_set():
+        attempt += 1
+        t0 = time.monotonic()
+        print(f"{ts()} [mDNS] Resolving {fqdn} (attempt {attempt})...", flush=True)
         zc = Zeroconf()
-        deadline = time.monotonic() + timeout
         try:
-            # Fire an mDNS query; the ESP32's response will populate zc.cache
             out = DNSOutgoing(0x0000)  # FLAGS_QR_QUERY = 0
             out.add_question(DNSQuestion(fqdn_dot, _TYPE_A, _CLASS_IN))
             zc.send(out)
 
+            deadline = time.monotonic() + retry_interval
             while time.monotonic() < deadline:
                 record = zc.cache.get_by_details(fqdn_dot, _TYPE_A, _CLASS_IN)
                 if record and isinstance(record, DNSAddress):
                     ip = socket.inet_ntoa(record.address)
                     elapsed = time.monotonic() - t0
-                    print(f"{ts()} Resolved {fqdn} -> {ip} (zeroconf, {elapsed:.2f}s)")
+                    print(f"{ts()} [mDNS] {fqdn} -> {ip} ({elapsed:.2f}s)", flush=True)
                     return ip
                 time.sleep(0.05)
         finally:
             zc.close()
-        print(f"{ts()} zeroconf timed out, falling back to OS resolver...", flush=True)
-    except Exception as exc:
+
         print(
-            f"{ts()} zeroconf unavailable ({exc}), falling back to OS resolver...",
+            f"{ts()} [mDNS] {fqdn} not found yet — is the ESP32 on and connected to WiFi?",
             flush=True,
         )
 
-    # --- Fallback: OS resolver ---
-    # socket.getaddrinfo() can block for several seconds per call on a cold
-    # avahi/Bonjour cache, so we run each attempt in a daemon thread with a
-    # hard 3s timeout to prevent a single hung call from eating all the time.
-    def _try_getaddrinfo(out: list) -> None:
-        try:
-            out.append(socket.getaddrinfo(fqdn, None)[0][4][0])
-        except socket.gaierror:
-            pass
+    raise RuntimeError("mDNS resolution cancelled (shutdown)")
 
-    for attempt in range(timeout):
-        result: list = []
-        t = threading.Thread(target=_try_getaddrinfo, args=(result,), daemon=True)
-        t.start()
-        t.join(timeout=3.0)
-        if result:
-            elapsed = time.monotonic() - t0
+
+def ensure_mdns_broadcast(service_name: str = "raspberrypi") -> None:
+    """Ensure this machine is reachable as `<service_name>.local` on the LAN.
+
+    - Linux/Pi: avahi-daemon handles .local advertisement at the OS level.
+      We just verify it's running and warn if not.
+    - Windows: avahi isn't available, so we register a zeroconf ServiceInfo
+      ourselves.  This is only needed for dev (deploying on Pi skips this path).
+    """
+    system = platform.system()
+
+    if system == "Linux":
+        # avahi-daemon is responsible for broadcasting <hostname>.local on Pi/Linux.
+        # Check it's actually running so we surface the problem early.
+        rc = os.system("systemctl is-active --quiet avahi-daemon 2>/dev/null")
+        if rc != 0:
             print(
-                f"{ts()} Resolved {fqdn} -> {result[0]} (OS resolver, {elapsed:.2f}s)"
+                f"{ts()} WARNING: avahi-daemon does not appear to be running. "
+                f"The ESP32 may not find '{service_name}.local'. "
+                "Run: sudo systemctl enable --now avahi-daemon",
+                flush=True,
             )
-            return result[0]
-        print(f"  attempt {attempt + 1}/{timeout} failed, retrying...")
-
-    raise RuntimeError(
-        f"mDNS resolution failed for {fqdn} after {timeout}s. "
-        "Ensure avahi-daemon is running on the Pi, or Bonjour is running on Windows."
-    )
-
-
-def start_windows_mdns_broadcast(service_name: str = "raspberrypi") -> None:
-    """
-    On Windows, broadcast this machine as `<service_name>.local` via zeroconf.
-    Not needed on Linux/macOS where avahi/mDNS handles this at the OS level.
-    """
-    if platform.system() != "Windows":
+        else:
+            print(
+                f"{ts()} [mDNS] avahi-daemon is running — "
+                f"'{service_name}.local' will be advertised automatically.",
+                flush=True,
+            )
         return
+
+    if system != "Windows":
+        return  # macOS has Bonjour built-in; nothing to do
+
+    # --- Windows dev path: broadcast via zeroconf ---
     try:
         from zeroconf import ServiceInfo, Zeroconf
     except ImportError:
@@ -433,6 +427,39 @@ audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 mqtt_client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="elio-receiver"
 )
+
+# Tracks whether Python's full startup sequence has completed (ESP32 audio
+# received, Piper loaded, etc.).  Set to True just before publishing
+# TOPIC_SYSTEM_READY.  Used by on_connect so that if the MQTT broker
+# restarts (or the ESP32 reconnects) we re-announce readiness.
+_system_ready: bool = False
+
+
+def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
+    """Re-subscribe and re-announce readiness whenever the broker connects."""
+    if reason_code == 0:
+        print(f"{ts()} [MQTT] Connected to broker.", flush=True)
+        client.subscribe(TOPIC_WAKE)
+        if _system_ready:
+            # Re-publish so an ESP32 that restarted while we were up gets the signal
+            client.publish(TOPIC_SYSTEM_READY, "1", retain=True)
+            print(
+                f"{ts()} [MQTT] Re-published system/ready after reconnect.", flush=True
+            )
+    else:
+        print(f"{ts()} [MQTT] Connect failed: reason_code={reason_code}", flush=True)
+
+
+def on_mqtt_disconnect(client, userdata, flags, reason_code, properties) -> None:
+    print(
+        f"{ts()} [MQTT] Disconnected (reason={reason_code}). "
+        "paho will reconnect automatically.",
+        flush=True,
+    )
+
+
+mqtt_client.on_connect = on_mqtt_connect
+mqtt_client.on_disconnect = on_mqtt_disconnect
 
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
@@ -942,6 +969,20 @@ def mqtt_publish(topic: str, payload: str) -> None:
         )
 
 
+def mqtt_publish_retained(topic: str, payload: str) -> None:
+    """Publish with retain=True so late-joining subscribers (e.g. a rebooted ESP32)
+    receive the last value immediately on connect without waiting for the next publish."""
+    if not mqtt_client.is_connected():
+        return
+    try:
+        mqtt_client.publish(topic, payload, retain=True)
+    except Exception as exc:
+        print(
+            f"{ts()} [MQTT] Retained publish failed ({topic!r} {payload!r}): {exc}",
+            flush=True,
+        )
+
+
 def reset_to_idle(reason: str = "") -> None:
     """
     Reset Python state and always tell ESP32 to turn off LED/chime.
@@ -1353,8 +1394,8 @@ def main() -> None:
         )
         load_silero_vad()
 
-    # Broadcast this machine as raspberrypi.local on Windows (no-op on Linux/Pi)
-    start_windows_mdns_broadcast("raspberrypi")
+    # Broadcast this machine as raspberrypi.local (Windows: via zeroconf; Linux: via avahi)
+    ensure_mdns_broadcast("raspberrypi")
 
     # Resolve ESP32's mDNS hostname to an IP for sending TTS audio back
     ESP32_IP = resolve_mdns(ESP32_MDNS_HOST)
@@ -1365,14 +1406,17 @@ def main() -> None:
     print(f"{ts()} Listening for UDP audio on port {UDP_PORT}...")
 
     # MQTT startup — always active (wake signals must work in RECORDING_MODE too
-    # if you ever want them; in normal mode this is required for wake word)
+    # if you ever want them; in normal mode this is required for wake word).
+    # connect_async + loop_start means we do not block if the broker is not ready
+    # yet; paho will keep retrying.  on_connect handles subscription so we never
+    # miss it even after a reconnect.
     mqtt_client.on_message = on_mqtt_message
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
-    mqtt_client.subscribe(TOPIC_WAKE)
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
+    mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT)
     mqtt_client.loop_start()  # spawns a daemon thread; no manual thread needed
     print(
-        f"{ts()} MQTT client connected to {MQTT_BROKER}:{MQTT_PORT}, "
-        f"subscribed to {TOPIC_WAKE}"
+        f"{ts()} MQTT client connecting to {MQTT_BROKER}:{MQTT_PORT} "
+        "(will retry automatically if broker is not ready yet)"
     )
 
     # On startup, force-clear any LED / chime state left over from a previous run
@@ -1414,19 +1458,23 @@ def main() -> None:
 
         warmup_llm()
 
-        print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
-    deadline = time.monotonic() + 10.0  # wait at most 10 seconds
-    while True:
+        print(
+            f"{ts()} Waiting for audio from ESP32 ({PREBUFFER_PKTS} packets to pre-buffer)..."
+        )
+    # Wait indefinitely for the ESP32 to come online — there is no point starting
+    # playback before audio is flowing.  Both sides depend on each other, so we
+    # simply wait here rather than printing a warning and charging ahead.
+    while not shutdown_event.is_set():
         with queue_lock:
             if len(packet_queue) >= PREBUFFER_PKTS:
                 break
-        if time.monotonic() > deadline:
-            print(f"{ts()} WARNING: No audio from ESP32 after 10s — continuing anyway.")
-            break
-        time.sleep(0.01)
+        time.sleep(0.05)
 
-    mqtt_publish(TOPIC_SYSTEM_READY, "1")
-    print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
+    global _system_ready
+    _system_ready = True
+    # retained=True so any ESP32 that connects (or reconnects) later sees it immediately
+    mqtt_publish_retained(TOPIC_SYSTEM_READY, "1")
+    print(f"{ts()} ESP32 audio flowing — system ready. Press Ctrl+C to stop.")
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
@@ -1443,6 +1491,9 @@ def main() -> None:
         shutdown_event.set()
 
         # Tell ESP32 to turn off LED / stop chime
+        # Clear the retained system/ready so a restarting ESP32 does not think
+        # Python is still up while we are shutting down.
+        mqtt_publish_retained(TOPIC_SYSTEM_READY, "")
         mqtt_publish(TOPIC_SYSTEM_SHUTDOWN, "1")
         mqtt_send_ctrl("stop")
         mqtt_client.loop_stop()
