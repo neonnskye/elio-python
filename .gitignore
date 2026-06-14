@@ -1,2 +1,6 @@
+# Cache
 __pycache__/
+.cache.sqlite
+
+# Weights
 models/
