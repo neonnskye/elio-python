@@ -50,6 +50,3 @@ def get_llm_context() -> str:
         f"Weather: {current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
         f"humidity {current_relative_humidity:.0f}%{precip_str}{rain_str}"
     )
-
-
-print(get_llm_context())

@@ -25,6 +25,8 @@ from groq import Groq
 from openai import OpenAI
 from piper import PiperVoice
 
+from context import get_llm_context
+
 # Sentinel pushed onto tts_queue after all sentences from one LLM turn are queued.
 # tts_dispatcher_loop forwards it to audio_queue (via audio_collector_loop) as None,
 # which audio_dispatch_loop uses to call reset_to_idle exactly once per turn.
@@ -743,7 +745,10 @@ def llm_loop() -> None:
             stream = llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {
+                        "role": "system",
+                        "content": f"{LLM_SYSTEM_PROMPT}\n\n{get_llm_context()}",
+                    },
                 ]
                 + messages_snapshot,
                 stream=True,
