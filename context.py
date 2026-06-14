@@ -4,7 +4,6 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-# Setup the Open-Meteo API client with cache and retry on error
 cache_session = requests_cache.CachedSession(".cache", expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
@@ -18,7 +17,6 @@ params = {
         "relative_humidity_2m",
         "apparent_temperature",
         "precipitation",
-        "rain",
     ],
     "timezone": "Asia/Colombo",
 }
@@ -31,25 +29,21 @@ current_temperature_2m = current.Variables(0).Value()
 current_relative_humidity = current.Variables(1).Value()
 current_apparent_temp = current.Variables(2).Value()
 current_precipitation = current.Variables(3).Value()
-current_rain = current.Variables(4).Value()
 
-local_time = datetime.fromtimestamp(
-    current.Time(), tz=timezone(timedelta(seconds=response.UtcOffsetSeconds()))
-)
+current_time = datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
 
 def get_llm_context() -> str:
     """Returns multi-line context string for use in an LLM system prompt."""
-    rain_str = f", {current_rain:.1f} mm rain" if current_rain > 0 else ""
     precip_str = (
-        f", light precipitation ({current_precipitation:.1f} mm{rain_str})"
+        f", precipitation {current_precipitation:.1f} mm"
         if current_precipitation > 0
         else ""
     )
     return (
         "User is currently located at the Faculty of Information Technology, "
         "University of Moratuwa, Katubedda, Sri Lanka.\n"
-        f"Current time: {local_time.strftime('%A, %B %d %Y, %I:%M %p')}\n"
+        f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Weather: {current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
         f"humidity {current_relative_humidity:.0f}%{precip_str}"
     )
