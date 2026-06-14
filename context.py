@@ -11,8 +11,8 @@ openmeteo = openmeteo_requests.Client(session=retry_session)
 
 url = "https://api.open-meteo.com/v1/forecast"
 params = {
-    "latitude": 6.7955,
-    "longitude": 79.9003,
+    "latitude": 6.7971255,
+    "longitude": 79.9018735,
     "current": [
         "temperature_2m",
         "relative_humidity_2m",
@@ -37,16 +37,9 @@ local_time = datetime.fromtimestamp(
     current.Time(), tz=timezone(timedelta(seconds=response.UtcOffsetSeconds()))
 )
 
-print(f"Time: {local_time.strftime('%A, %B %d %Y, %I:%M %p')}")
-print(
-    f"Temperature: {current_temperature_2m:.1f}°C (feels like {current_apparent_temp:.1f}°C)"
-)
-print(f"Humidity: {current_relative_humidity:.0f}%")
-print(f"Precipitation: {current_precipitation:.1f} mm (rain: {current_rain:.1f} mm)")
 
-
-def get_weather_context() -> str:
-    """Returns a one-line weather string for use in an LLM system prompt."""
+def get_llm_context() -> str:
+    """Returns multi-line context string for use in an LLM system prompt."""
     rain_str = f", {current_rain:.1f} mm rain" if current_rain > 0 else ""
     precip_str = (
         f", light precipitation ({current_precipitation:.1f} mm{rain_str})"
@@ -54,10 +47,12 @@ def get_weather_context() -> str:
         else ""
     )
     return (
-        f"Weather in Katubedda ({local_time.strftime('%A, %B %d %Y, %I:%M %p')}): "
-        f"{current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
+        "User is currently located at the Faculty of Information Technology, "
+        "University of Moratuwa, Katubedda, Sri Lanka.\n"
+        f"Current time: {local_time.strftime('%A, %B %d %Y, %I:%M %p')}\n"
+        f"Weather: {current_temperature_2m:.1f}°C, feels like {current_apparent_temp:.1f}°C, "
         f"humidity {current_relative_humidity:.0f}%{precip_str}"
     )
 
 
-print(get_weather_context())
+print(get_llm_context())
