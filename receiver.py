@@ -1256,8 +1256,8 @@ def receive_loop(sock: socket.socket) -> None:
             continue
         if len(data) != expected_bytes:
             continue
-        raw = np.frombuffer(data, dtype="<u2").astype(np.float32)
-        audio = (raw - 2048.0) / 2048.0
+        raw = np.frombuffer(data, dtype="<i2").astype(np.float32)
+        audio = raw / 32768.0
         audio = audio - np.mean(audio)
 
         # Noise gate: only applies to playback if you want to suppress idle hiss.
