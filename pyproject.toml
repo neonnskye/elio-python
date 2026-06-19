@@ -19,6 +19,7 @@ dependencies = [
     "retry-requests>=2.0.0",
     "scipy>=1.17.1",
     "sounddevice>=0.5.5",
+    "tensorflow>=2.21.0",
     "torch>=2.12.0",
     "torchaudio>=2.11.0",
     "zeroconf>=0.149.16",
