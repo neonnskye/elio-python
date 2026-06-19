@@ -92,14 +92,18 @@ LLM_MODEL = "deepseek-v4-flash"
 
 def _load_system_prompt() -> str:
     """Read the LLM system prompt from system.md (sibling of receiver.py)."""
-    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system.md")
+    prompt_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "docs/system.md"
+    )
     with open(prompt_path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
 
 LLM_SYSTEM_PROMPT = _load_system_prompt()
 
-STORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stories.json")
+STORIES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "docs/stories.json"
+)
 
 # Keywords that trigger the story-picker (case-insensitive)
 STORY_KEYWORDS = {"story", "stories", "tale", "tales"}
