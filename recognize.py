@@ -13,6 +13,8 @@ class FacialRecognition:
         self.latest_frame = None
         self._lock = threading.Lock()
         self._cap = cv2.VideoCapture(3)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
     def read_cam(self):
         if not self._cap.isOpened():
@@ -40,12 +42,23 @@ class FacialRecognition:
 recognition = FacialRecognition()
 
 
-@app.route("/")
+@app.route("/stream")
 def stream():
     return Response(
         recognition.generate_mjpeg(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.route("/")
+def index():
+    return """
+    <html>
+    <body style="margin:0;background:#000">
+        <img src="/stream" style="width:100%;height:100vh;object-fit:contain">
+    </body>
+    </html>
+    """
 
 
 if __name__ == "__main__":
