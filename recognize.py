@@ -29,6 +29,10 @@ class FacialRecognition:
     def __init__(self):
         self.HOST_OS = platform.system()
         self.latest_frame = None
+        # Snapshot of (raw_frame, faces) from the most recent detection pass.
+        # Enrollment reads this so it reuses the *same* detection result that
+        # produced the bounding box visible on screen — no second detect() call.
+        self._latest_raw: tuple[np.ndarray, any] | None = None
         self._lock = threading.Lock()
         self._cap = cv2.VideoCapture(3)
 
@@ -92,19 +96,19 @@ class FacialRecognition:
     # ------------------------------------------------------------------
     def enroll_from_frame(self, name: str) -> tuple[bool, str]:
         """
-        Capture the latest webcam frame, find the largest face,
-        and add its embedding to known_faces under `name`.
+        Use the most recent raw frame + detection result from read_cam to
+        enroll a face under `name`.  Reusing the cached detection avoids the
+        race where a second detect() call on a slightly-later frame misses the
+        face that was visible on screen when the user clicked Enroll.
         Returns (success, message).
         """
         with self._lock:
-            frame = self.latest_frame.copy() if self.latest_frame is not None else None
+            snapshot = self._latest_raw
 
-        if frame is None:
+        if snapshot is None:
             return False, "No frame available from camera."
 
-        h, w = frame.shape[:2]
-        self._detector.setInputSize((w, h))
-        _, faces = self._detector.detect(frame)
+        frame, faces = snapshot
 
         if faces is None or len(faces) == 0:
             return False, "No face detected in frame."
@@ -221,20 +225,39 @@ class FacialRecognition:
             h, w = frame.shape[:2]
             self._detector.setInputSize((w, h))
             _, faces = self._detector.detect(frame)
+
+            # Stash the *raw* frame + detection result before annotation so
+            # enroll_from_frame can reuse this exact detection (no race).
+            raw_snapshot = (frame.copy(), faces)
+
             annotated = self._annotate(frame, faces)
 
             with self._lock:
                 self.latest_frame = annotated
+                self._latest_raw = raw_snapshot
 
     def generate_mjpeg(self):
+        import time
+
         while True:
-            with self._lock:
-                if self.latest_frame is None:
+            try:
+                with self._lock:
+                    frame = self.latest_frame
+                if frame is None:
+                    time.sleep(0.01)
                     continue
-                _, buf = cv2.imencode(".jpg", self.latest_frame)
-            yield (
-                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
-            )
+                ok, buf = cv2.imencode(".jpg", frame)
+                if not ok:
+                    time.sleep(0.01)
+                    continue
+                yield (
+                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                    + buf.tobytes()
+                    + b"\r\n"
+                )
+            except Exception as e:
+                print(f"[MJPEG] stream error (continuing): {e}")
+                time.sleep(0.01)
 
 
 recognition = FacialRecognition()
