@@ -55,6 +55,9 @@ class FacialRecognition:
         # seen in the previous frame, used to skip the expensive SFace forward
         # pass when a face hasn't moved far enough to be a new person.
         self._tracked_faces: list[tuple[float, float, str]] = []
+        # Incremented on every enrollment so _annotate knows to bust the cache.
+        self._db_version: int = 0
+        self._tracked_faces_db_version: int = 0
         self._load_db()
 
     # ------------------------------------------------------------------
@@ -126,6 +129,7 @@ class FacialRecognition:
             self._known_faces[key] = {"display": display, "embeddings": []}
 
         self._known_faces[key]["embeddings"].append(embedding)
+        self._db_version += 1
         self._save_db()
 
         count = len(self._known_faces[key]["embeddings"])
@@ -171,6 +175,12 @@ class FacialRecognition:
         if faces is None:
             self._tracked_faces = []
             return frame
+
+        # If the face DB was updated since we last ran (e.g. a new enroll),
+        # clear the position cache so every face gets re-identified immediately.
+        if self._tracked_faces_db_version != self._db_version:
+            self._tracked_faces = []
+            self._tracked_faces_db_version = self._db_version
 
         new_tracked: list[tuple[float, float, str]] = []
         used: set[int] = set()
