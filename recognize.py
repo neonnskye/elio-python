@@ -58,7 +58,7 @@ class FacialRecognition:
         for key, display, emb in zip(keys, displays, embeddings):
             if key not in self._known_faces:
                 self._known_faces[key] = {"display": display, "embeddings": []}
-            self._known_faces[key]["embeddings"].append(np.array(emb))
+            self._known_faces[key]["embeddings"].append(np.array(emb, dtype=np.float32))
 
         print(
             f"Loaded {sum(len(v['embeddings']) for v in self._known_faces.values())} embeddings for {len(self._known_faces)} people."
