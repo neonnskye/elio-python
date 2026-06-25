@@ -6,6 +6,11 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
 
+# picamera2 is only available on Linux/Raspberry Pi — import lazily so the
+# module can still be loaded on Windows without the package installed.
+if platform.system() == "Linux":
+    from picamera2 import Picamera2
+
 app = Flask(__name__)
 
 # Download these from the OpenCV zoo:
@@ -34,7 +39,22 @@ class FacialRecognition:
         # produced the bounding box visible on screen — no second detect() call.
         self._latest_raw: tuple[np.ndarray, any] | None = None
         self._lock = threading.Lock()
-        self._cap = cv2.VideoCapture(3)
+
+        # --- Camera init: OpenCV on Windows, picamera2 on Linux (Pi) ---
+        if self.HOST_OS == "Linux":
+            self._picam = Picamera2()
+            # RGB888 gives us a plain HxWx3 uint8 array; we convert to BGR for OpenCV.
+            config = self._picam.create_video_configuration(
+                main={"format": "RGB888", "size": (1280, 720)}
+            )
+            self._picam.configure(config)
+            self._picam.start()
+            self._cap = None
+            print("Camera: picamera2 (Raspberry Pi)")
+        else:
+            self._picam = None
+            self._cap = cv2.VideoCapture(3)  # OBS Virtual Camera
+            print("Camera: OpenCV VideoCapture (Windows)")
 
         # --- YuNet detector ---
         self._detector = cv2.FaceDetectorYN.create(
@@ -222,7 +242,30 @@ class FacialRecognition:
     # ------------------------------------------------------------------
     # Main capture loop
     # ------------------------------------------------------------------
+    def _process_frame(self, frame: np.ndarray):
+        """Run detection + annotation on one frame and stash results."""
+        h, w = frame.shape[:2]
+        self._detector.setInputSize((w, h))
+        _, faces = self._detector.detect(frame)
+
+        # Stash the *raw* frame + detection result before annotation so
+        # enroll_from_frame can reuse this exact detection (no race).
+        raw_snapshot = (frame.copy(), faces)
+
+        annotated = self._annotate(frame, faces)
+
+        with self._lock:
+            self.latest_frame = annotated
+            self._latest_raw = raw_snapshot
+
     def read_cam(self):
+        if self.HOST_OS == "Linux":
+            self._read_cam_picamera2()
+        else:
+            self._read_cam_opencv()
+
+    def _read_cam_opencv(self):
+        """Capture loop using OpenCV VideoCapture (Windows / generic USB cam)."""
         if not self._cap.isOpened():
             print("Error: Could not open webcam.")
             return
@@ -231,20 +274,16 @@ class FacialRecognition:
             ret, frame = self._cap.read()
             if not ret:
                 break
+            self._process_frame(frame)
 
-            h, w = frame.shape[:2]
-            self._detector.setInputSize((w, h))
-            _, faces = self._detector.detect(frame)
-
-            # Stash the *raw* frame + detection result before annotation so
-            # enroll_from_frame can reuse this exact detection (no race).
-            raw_snapshot = (frame.copy(), faces)
-
-            annotated = self._annotate(frame, faces)
-
-            with self._lock:
-                self.latest_frame = annotated
-                self._latest_raw = raw_snapshot
+    def _read_cam_picamera2(self):
+        """Capture loop using picamera2 (Raspberry Pi camera module)."""
+        while True:
+            # capture_array() returns an RGB888 HxWx3 uint8 ndarray.
+            rgb_frame = self._picam.capture_array()
+            # Convert RGB → BGR so OpenCV annotation/encoding works correctly.
+            bgr_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+            self._process_frame(bgr_frame)
 
     def generate_mjpeg(self):
         import time
