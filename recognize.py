@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import paho.mqtt.client as mqtt
 from flask import Flask, Response, jsonify, render_template, request
 
 # picamera2 is only available on Linux/Raspberry Pi — import lazily so the
@@ -28,6 +29,31 @@ MATCH_DIST_PX = 60
 
 # Persistent face database path
 FACES_DB = Path("faces_db.npz")
+
+# ---- MQTT ----
+MQTT_BROKER = "127.0.0.1"
+MQTT_PORT = 1883
+TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
+
+_mqtt_client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id="elio-camera",
+)
+_mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
+_mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT)
+_mqtt_client.loop_start()
+
+
+def _mqtt_publish(topic: str, payload: str) -> None:
+    if not _mqtt_client.is_connected():
+        return
+    try:
+        _mqtt_client.publish(topic, payload)
+    except Exception as exc:
+        print(f"[MQTT] Publish failed ({topic!r} {payload!r}): {exc}", flush=True)
+
+
+# ---------------
 
 
 class FacialRecognition:
@@ -78,6 +104,10 @@ class FacialRecognition:
         # Incremented on every enrollment so _annotate knows to bust the cache.
         self._db_version: int = 0
         self._tracked_faces_db_version: int = 0
+        # Names (display) that have already triggered an MQTT face/seen pub this
+        # session.  Reset only when the process restarts, so each person gets
+        # greeted at most once per run.
+        self._greeted: set[str] = set()
         self._load_db()
 
     # ------------------------------------------------------------------
@@ -231,6 +261,19 @@ class FacialRecognition:
             new_tracked.append((cx, cy, label))
 
             color = (0, 255, 0) if not label.startswith("Unknown") else (0, 0, 255)
+
+            # Fire MQTT exactly once per session for each known face.
+            if not label.startswith("Unknown"):
+                # label is "<DisplayName> (0.xx)" — extract just the name part.
+                display_name = label.rsplit(" (", 1)[0]
+                if display_name not in self._greeted:
+                    self._greeted.add(display_name)
+                    _mqtt_publish(TOPIC_FACE_SEEN, display_name)
+                    print(
+                        f"[FACE] First sighting of {display_name!r} this session — "
+                        f"published to {TOPIC_FACE_SEEN}",
+                        flush=True,
+                    )
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
                 frame, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
