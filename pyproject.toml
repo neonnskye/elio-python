@@ -9,7 +9,7 @@ dependencies = [
     "groq>=1.4.0",
     "numpy>=2.4.6",
     "openai>=2.38.0",
-    "opencv-python>=4.13.0.92",
+    "opencv-python>=4.13.0.92; platform_system == 'Windows'",
     "openmeteo-requests>=1.7.5",
     "packaging>=26.2",
     "paho-mqtt>=2.1.0",
