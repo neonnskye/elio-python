@@ -3,7 +3,7 @@ import threading
 
 import cv2
 import numpy as np
-from flask import Flask, Response
+from flask import Flask, Response, render_template
 
 app = Flask(__name__)
 
@@ -146,13 +146,7 @@ def stream():
 
 @app.route("/")
 def index():
-    return """
-    <html>
-    <body style="margin:0;background:#000">
-        <img src="/stream" style="width:100%;height:100vh;object-fit:contain">
-    </body>
-    </html>
-    """
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
