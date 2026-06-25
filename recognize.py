@@ -16,6 +16,11 @@ SFACE_MODEL = "models/face_recognition_sface_2021dec.onnx"
 
 COSINE_THRESHOLD = 0.363  # below this → different person
 
+# Max distance (px) between a face's bbox center this frame and last frame
+# before we treat it as the same person and reuse the cached label.
+# Below this: reuse cached label (skip SFace CNN). Above: re-identify.
+MATCH_DIST_PX = 60
+
 # Persistent face database path
 FACES_DB = Path("faces_db.npz")
 
@@ -42,6 +47,10 @@ class FacialRecognition:
 
         # known_faces: { "name_lower": { "display": str, "embeddings": list[np.ndarray] } }
         self._known_faces: dict[str, dict] = {}
+        # Per-face tracking cache for _annotate: (cx, cy, label) for each face
+        # seen in the previous frame, used to skip the expensive SFace forward
+        # pass when a face hasn't moved far enough to be a new person.
+        self._tracked_faces: list[tuple[float, float, str]] = []
         self._load_db()
 
     # ------------------------------------------------------------------
@@ -149,20 +158,51 @@ class FacialRecognition:
         return f"{best_name} ({best_score:.2f})"
 
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
-        """Draw bounding boxes and identity labels on frame."""
+        """Draw bounding boxes and identity labels on frame.
+
+        Reuses cached labels from the previous frame for faces whose bbox
+        center hasn't moved more than MATCH_DIST_PX — only "new" faces
+        (by position) pay the full SFace feature() cost.
+        """
         if faces is None:
+            self._tracked_faces = []
             return frame
+
+        new_tracked: list[tuple[float, float, str]] = []
+        used: set[int] = set()
+
         for face in faces:
             x, y, w, h = (int(v) for v in face[:4])
-            aligned = self._recognizer.alignCrop(frame, face)
-            emb = self._recognizer.feature(aligned)
-            label = self._identify(emb)
+            cx, cy = x + w / 2, y + h / 2
+
+            # Find the closest unclaimed face we tracked last frame
+            best_i, best_d = -1, MATCH_DIST_PX
+            for i, (px, py, _label) in enumerate(self._tracked_faces):
+                if i in used:
+                    continue
+                d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+
+            if best_i >= 0:
+                label = self._tracked_faces[best_i][2]
+                used.add(best_i)
+            else:
+                # New face — run the expensive recognition path
+                aligned = self._recognizer.alignCrop(frame, face)
+                emb = self._recognizer.feature(aligned)
+                label = self._identify(emb)
+
+            new_tracked.append((cx, cy, label))
 
             color = (0, 255, 0) if not label.startswith("Unknown") else (0, 0, 255)
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
                 frame, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
             )
+
+        self._tracked_faces = new_tracked
         return frame
 
     # ------------------------------------------------------------------
