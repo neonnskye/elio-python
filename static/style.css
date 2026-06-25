@@ -38,8 +38,13 @@ body {
 
 .enroll-form {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     width: 480px;
+}
+
+#status-msg {
+    flex-basis: 100%;
 }
 
 #name-input {
