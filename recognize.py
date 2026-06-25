@@ -1,9 +1,10 @@
 import platform
 import threading
+from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, Response, render_template
+from flask import Flask, Response, jsonify, render_template, request
 
 app = Flask(__name__)
 
@@ -14,7 +15,9 @@ YUNET_MODEL = "models/face_detection_yunet_2023mar.onnx"
 SFACE_MODEL = "models/face_recognition_sface_2021dec.onnx"
 
 COSINE_THRESHOLD = 0.363  # below this → different person
-L2_THRESHOLD = 1.128  # above this → different person (alternative metric)
+
+# Persistent face database path
+FACES_DB = Path("faces_db.npz")
 
 
 class FacialRecognition:
@@ -28,7 +31,7 @@ class FacialRecognition:
         self._detector = cv2.FaceDetectorYN.create(
             YUNET_MODEL,
             "",
-            (320, 320),  # input size; updated dynamically per frame
+            (320, 320),
             score_threshold=0.6,
             nms_threshold=0.3,
             top_k=5000,
@@ -37,20 +40,84 @@ class FacialRecognition:
         # --- SFace recognizer ---
         self._recognizer = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
 
-        # known_faces: { "Name": np.ndarray (128-d embedding) }
-        self._known_faces: dict[str, np.ndarray] = {}
+        # known_faces: { "name_lower": { "display": str, "embeddings": list[np.ndarray] } }
+        self._known_faces: dict[str, dict] = {}
+        self._load_db()
 
     # ------------------------------------------------------------------
-    # Public: enroll a person from a single image file
+    # Persistence
     # ------------------------------------------------------------------
-    def enroll_from_file(self, name: str, image_path: str):
-        img = cv2.imread(image_path)
-        embedding = self._get_embedding(img)
-        if embedding is not None:
-            self._known_faces[name] = embedding
-            print(f"Enrolled: {name}")
-        else:
-            print(f"No face found in {image_path}")
+    def _load_db(self):
+        if not FACES_DB.exists():
+            return
+        data = np.load(FACES_DB, allow_pickle=True)
+        keys = data["keys"].tolist()  # list of lowercase name keys
+        displays = data["displays"].tolist()  # list of display names
+        embeddings = data["embeddings"].tolist()  # list of np arrays
+
+        for key, display, emb in zip(keys, displays, embeddings):
+            if key not in self._known_faces:
+                self._known_faces[key] = {"display": display, "embeddings": []}
+            self._known_faces[key]["embeddings"].append(np.array(emb))
+
+        print(
+            f"Loaded {sum(len(v['embeddings']) for v in self._known_faces.values())} embeddings for {len(self._known_faces)} people."
+        )
+
+    def _save_db(self):
+        keys, displays, embeddings = [], [], []
+        for key, entry in self._known_faces.items():
+            for emb in entry["embeddings"]:
+                keys.append(key)
+                displays.append(entry["display"])
+                embeddings.append(emb)
+        np.savez(
+            FACES_DB,
+            keys=np.array(keys),
+            displays=np.array(displays),
+            embeddings=np.array(embeddings, dtype=object),
+        )
+
+    # ------------------------------------------------------------------
+    # Public: enroll from the live webcam frame
+    # ------------------------------------------------------------------
+    def enroll_from_frame(self, name: str) -> tuple[bool, str]:
+        """
+        Capture the latest webcam frame, find the largest face,
+        and add its embedding to known_faces under `name`.
+        Returns (success, message).
+        """
+        with self._lock:
+            frame = self.latest_frame.copy() if self.latest_frame is not None else None
+
+        if frame is None:
+            return False, "No frame available from camera."
+
+        h, w = frame.shape[:2]
+        self._detector.setInputSize((w, h))
+        _, faces = self._detector.detect(frame)
+
+        if faces is None or len(faces) == 0:
+            return False, "No face detected in frame."
+
+        # Pick the largest face by bounding-box area
+        largest = max(faces, key=lambda f: f[2] * f[3])
+
+        aligned = self._recognizer.alignCrop(frame, largest)
+        embedding = self._recognizer.feature(aligned)
+
+        key = name.strip().lower()
+        display = name.strip()
+
+        if key not in self._known_faces:
+            self._known_faces[key] = {"display": display, "embeddings": []}
+
+        self._known_faces[key]["embeddings"].append(embedding)
+        self._save_db()
+
+        count = len(self._known_faces[key]["embeddings"])
+        print(f"Enrolled: {display!r} (now has {count} photo(s))")
+        return True, f"Enrolled {display!r} ({count} photo(s) total)."
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -62,21 +129,21 @@ class FacialRecognition:
         _, faces = self._detector.detect(frame)
         if faces is None or len(faces) == 0:
             return None
-        # Use the highest-confidence face (first after NMS)
         aligned = self._recognizer.alignCrop(frame, faces[0])
         return self._recognizer.feature(aligned)
 
     def _identify(self, embedding: np.ndarray) -> str:
-        """Cosine-match embedding against enrolled faces."""
+        """Cosine-match embedding against all enrolled embeddings (multi-photo support)."""
         best_name = "Unknown"
         best_score = -1.0
-        for name, known_emb in self._known_faces.items():
-            score = self._recognizer.match(
-                embedding, known_emb, cv2.FaceRecognizerSF_FR_COSINE
-            )
-            if score > best_score:
-                best_score = score
-                best_name = name
+        for key, entry in self._known_faces.items():
+            for known_emb in entry["embeddings"]:
+                score = self._recognizer.match(
+                    embedding, known_emb, cv2.FaceRecognizerSF_FR_COSINE
+                )
+                if score > best_score:
+                    best_score = score
+                    best_name = entry["display"]
         if best_score < COSINE_THRESHOLD:
             return "Unknown"
         return f"{best_name} ({best_score:.2f})"
@@ -132,9 +199,6 @@ class FacialRecognition:
 
 recognition = FacialRecognition()
 
-# Enroll known faces before starting — add as many as you need
-# recognition.enroll_from_file("Amrith", "amrith.jpg")
-
 
 @app.route("/stream")
 def stream():
@@ -142,6 +206,17 @@ def stream():
         recognition.generate_mjpeg(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.route("/enroll", methods=["POST"])
+def enroll():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "message": "Name cannot be empty."}), 400
+    ok, message = recognition.enroll_from_frame(name)
+    status = 200 if ok else 422
+    return jsonify({"ok": ok, "message": message}), status
 
 
 @app.route("/")
