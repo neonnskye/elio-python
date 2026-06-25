@@ -279,11 +279,10 @@ class FacialRecognition:
     def _read_cam_picamera2(self):
         """Capture loop using picamera2 (Raspberry Pi camera module)."""
         while True:
-            # capture_array() returns an RGB888 HxWx3 uint8 ndarray.
-            rgb_frame = self._picam.capture_array()
-            # Convert RGB → BGR so OpenCV annotation/encoding works correctly.
-            bgr_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-            self._process_frame(bgr_frame)
+            frame = self._picam.capture_array()
+            # capture_array() with RGB888 returns BGR-ordered data in practice —
+            # do NOT convert, just pass directly to OpenCV.
+            self._process_frame(frame)
 
     def generate_mjpeg(self):
         import time
