@@ -108,63 +108,6 @@ STORIES_PATH = os.path.join(
 # Keywords that trigger the story-picker (case-insensitive)
 STORY_KEYWORDS = {"story", "stories", "tale", "tales"}
 
-# ---- Robot command dispatch ----
-# DEPRECATED: keyword-based command dispatch replaced by LLM CMD tag protocol.
-# These are kept for reference and can be removed once the new system is validated.
-# Each entry is (frozenset_of_required_words, mqtt_payload).
-# Checked in order; first match wins.  The transcript must contain ALL words in
-# the set (order-independent, case-insensitive) to trigger the command.
-# Triggering a command also sends "MODE-2" first to ensure manual mode is active,
-# then skips forwarding the transcript to the LLM.
-ROBOT_COMMANDS: list[tuple[frozenset, str]] = [
-    # --- Movement ---
-    (frozenset({"go", "forward"}), "MANUAL:FORWARD"),
-    (frozenset({"move", "forward"}), "MANUAL:FORWARD"),
-    (frozenset({"go", "back"}), "MANUAL:BACKWARD"),
-    (frozenset({"move", "back"}), "MANUAL:BACKWARD"),
-    (frozenset({"go", "backward"}), "MANUAL:BACKWARD"),
-    (frozenset({"move", "backward"}), "MANUAL:BACKWARD"),
-    (frozenset({"go", "reverse"}), "MANUAL:BACKWARD"),
-    (frozenset({"turn", "left"}), "MANUAL:LEFT"),
-    (frozenset({"go", "left"}), "MANUAL:LEFT"),
-    (frozenset({"turn", "right"}), "MANUAL:RIGHT"),
-    (frozenset({"go", "right"}), "MANUAL:RIGHT"),
-    (frozenset({"stop"}), "MANUAL:STOP"),
-    (frozenset({"halt"}), "MANUAL:STOP"),
-    (frozenset({"freeze"}), "MANUAL:STOP"),
-    # --- Dance ---
-    (frozenset({"dance", "one"}), "DANCE:1"),
-    (frozenset({"dance", "1"}), "DANCE:1"),
-    (frozenset({"dance", "first"}), "DANCE:1"),
-    (frozenset({"dance", "two"}), "DANCE:2"),
-    (frozenset({"dance", "2"}), "DANCE:2"),
-    (frozenset({"dance", "second"}), "DANCE:2"),
-    (frozenset({"dance", "three"}), "DANCE:3"),
-    (frozenset({"dance", "3"}), "DANCE:3"),
-    (frozenset({"dance", "third"}), "DANCE:3"),
-]
-
-
-def check_for_robot_command(text: str) -> str | None:
-    """Check whether *text* matches any entry in ROBOT_COMMANDS.
-
-    Returns the MQTT payload string (e.g. 'MANUAL:FORWARD') if a match is
-    found, or None if the transcript should be forwarded to the LLM as usual.
-    """
-    words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    for required_words, payload in ROBOT_COMMANDS:
-        if required_words.issubset(words):
-            return payload
-    return None
-
-
-def dispatch_robot_command(payload: str) -> None:
-    """Set the robot to manual mode then publish the movement/dance command."""
-    mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
-    time.sleep(0.05)  # small gap so the motor controller processes mode switch first
-    mqtt_publish(TOPIC_ROBOT_CMD, payload)
-    print(f"{ts()} [CMD] Robot command dispatched -> {payload}", flush=True)
-
 
 # Matches [CMD:PAYLOAD] tags emitted by the LLM (e.g. [CMD:MANUAL:FORWARD])
 _CMD_TAG_RE = re.compile(r"\[CMD:([A-Z0-9_:]+)\]", re.IGNORECASE)
@@ -1128,7 +1071,7 @@ def synthesize_text(text: str) -> np.ndarray:
     if peak > 0:
         pcm_resampled = pcm_resampled / peak
 
-    pcm_int16 = (pcm_resampled * 0.6 * 32767).clip(-32768, 32767).astype(np.int16)
+    pcm_int16 = (pcm_resampled * 1 * 32767).clip(-32768, 32767).astype(np.int16)
     return pcm_int16
 
 
