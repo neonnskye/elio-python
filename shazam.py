@@ -87,7 +87,11 @@ SMOOTHING_WINDOW = 4
 # ACRCloud settings
 RECORD_SECONDS = 7  # seconds to record for fingerprinting
 ACR_SAMPLE_RATE = 44100  # ACRCloud works best at 44100 Hz
-MIN_IDENTIFY_GAP_S = 60  # minimum seconds between two identifications
+
+# Grace period: music must be absent for this long before we consider it
+# truly "off". Prevents a brief dip (breath, quiet bar, etc.) from
+# resetting the trigger during a continuous track.
+MUSIC_OFF_GRACE_S = 5.0
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -96,8 +100,10 @@ MIN_IDENTIFY_GAP_S = 60  # minimum seconds between two identifications
 recent_music_flags: list[bool] = []
 state_lock = threading.Lock()
 
-last_identify_time = 0.0
-identifying = False
+# Rising-edge detection state
+music_was_confirmed_off: bool = True  # True at startup so first music fires
+music_off_since: float | None = None  # wall-clock time music last dropped
+identifying: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +240,7 @@ def record_and_identify(pa: pyaudio.PyAudio) -> None:
             capture_output=True,
             text=True,
             timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         raw_output = result.stdout or result.stderr or "(no output)"
 
@@ -283,7 +290,7 @@ def process_results(
     timestamp_ms: int,
     pa: pyaudio.PyAudio,  # passed so record thread can open its own stream
 ) -> None:
-    global last_identify_time, identifying
+    global music_was_confirmed_off, music_off_since, identifying
 
     music_detected = any(is_music_label(name) for name, _ in results)
     music_hits = [(n, s) for n, s in results if is_music_label(n)]
@@ -299,37 +306,56 @@ def process_results(
         )
         music_on = smoothed >= 0.5
 
-    status = "🎵 MUSIC" if music_on else "🔇 No music"
-    if music_hits:
-        top_label, top_score = music_hits[0]
-        print(
-            f"\r[{timestamp_ms:>8} ms] {status}  ({top_label}: {top_score:.2f})        ",
-            end="",
-            flush=True,
-        )
-    else:
-        print(
-            f"\r[{timestamp_ms:>8} ms] {status}                                        ",
-            end="",
-            flush=True,
-        )
-
     now = time.time()
-    if (
-        music_on
-        and not identifying
-        and (now - last_identify_time) >= MIN_IDENTIFY_GAP_S
-    ):
-        identifying = True
-        last_identify_time = now
 
-        # Pass `pa` so the thread can open its own fresh stream
+    # ── Grace-period tracking ────────────────────────────────────────────
+    # When music goes off, start a timer. Only mark it "confirmed off"
+    # once it has been gone for the full grace period. If music comes back
+    # before the timer expires, cancel it — it never really went away.
+    if not music_on:
+        if music_off_since is None:
+            music_off_since = now  # start the off-timer
+        elif (
+            now - music_off_since
+        ) >= MUSIC_OFF_GRACE_S and not music_was_confirmed_off:
+            music_was_confirmed_off = True
+            print("\n🔕  Music confirmed off (grace period elapsed).", flush=True)
+    else:
+        music_off_since = None  # music is back — reset off-timer
+
+    # ── Rising-edge trigger ──────────────────────────────────────────────
+    # Fire only when music comes ON after a confirmed-off period.
+    if music_on and music_was_confirmed_off and not identifying:
+        music_was_confirmed_off = False  # consume the rising edge
+        identifying = True
         t = threading.Thread(
             target=record_and_identify,
             args=(pa,),
             daemon=True,
         )
         t.start()
+
+    # ── Status line ──────────────────────────────────────────────────────
+    grace_indicator = ""
+    if not music_on and music_off_since is not None and not music_was_confirmed_off:
+        elapsed = now - music_off_since
+        remaining = max(0.0, MUSIC_OFF_GRACE_S - elapsed)
+        grace_indicator = f"  [grace {remaining:.1f}s]"
+
+    status = "🎵 MUSIC" if music_on else "🔇 No music"
+    if music_hits:
+        top_label, top_score = music_hits[0]
+        print(
+            f"\r[{timestamp_ms:>8} ms] {status}  ({top_label}: {top_score:.2f}){grace_indicator}        ",
+            end="",
+            flush=True,
+        )
+    else:
+        print(
+            f"\r[{timestamp_ms:>8} ms] {status}{grace_indicator}                                        ",
+            end="",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
