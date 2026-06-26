@@ -37,6 +37,8 @@ data_type = "audio"
 signature_version = "1"
 timestamp = time.time()
 
+sys.stdout.reconfigure(encoding="utf-8")
+
 string_to_sign = (
     http_method
     + "\n"
