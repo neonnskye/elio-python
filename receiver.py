@@ -1324,17 +1324,31 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
         ) >= MUSIC_OFF_GRACE_S and not _music_was_confirmed_off:
             _music_was_confirmed_off = True
             print(f"{ts()} [music] No music (grace period elapsed).", flush=True)
+            print(f"{ts()} [music] Stopping movement / dance.", flush=True)
+            mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+            time.sleep(0.05)
+            mqtt_publish(TOPIC_ROBOT_CMD, "MANUAL:STOP")
     else:
         _music_off_since = None  # music back — reset off-timer
 
     # Rising-edge: fire only when music comes ON after a confirmed-off period
-    if music_on and _music_was_confirmed_off and not _music_identifying:
+    if music_on and _music_was_confirmed_off:
         _music_was_confirmed_off = False
-        _music_identifying = True
-        print(f"{ts()} [music] Music detected.", flush=True)
-        snapshot = np.array(list(_music_record_buffer), dtype=np.float32)
-        t = threading.Thread(target=_music_identify, args=(snapshot,), daemon=True)
-        t.start()
+
+        # Pick a random dance routine (1, 2, or 3) and start dancing immediately
+        dance_idx = random.randint(1, 3)
+        print(
+            f"{ts()} [music] Music detected. Starting dance {dance_idx}...", flush=True
+        )
+        mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+        time.sleep(0.05)
+        mqtt_publish(TOPIC_ROBOT_CMD, f"DANCE:{dance_idx}")
+
+        if not _music_identifying:
+            _music_identifying = True
+            snapshot = np.array(list(_music_record_buffer), dtype=np.float32)
+            t = threading.Thread(target=_music_identify, args=(snapshot,), daemon=True)
+            t.start()
 
 
 def _music_identify(snapshot: np.ndarray) -> None:
