@@ -1,5 +1,6 @@
 import collections
 import concurrent.futures
+import csv
 import io
 import json
 import os
@@ -8,7 +9,9 @@ import queue
 import random
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -21,6 +24,13 @@ import paho.mqtt.client as mqtt
 import scipy.signal
 import sounddevice as sd
 import torch
+
+try:
+    import tflite_runtime.interpreter as tflite  # Raspberry Pi
+except ModuleNotFoundError:
+    import tensorflow as tf  # Windows / Mac
+
+    tflite = tf.lite
 from groq import Groq
 from openai import OpenAI
 from piper import PiperVoice
@@ -88,6 +98,44 @@ TTS_PCM_RATE = 22050  # Piper medium-quality voices output at 22050 Hz
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 LLM_MODEL = "deepseek-v4-flash"
+
+# ---- YAMNet / Music Detection ----
+YAMNET_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "yamnet.tflite"
+)
+YAMNET_CLASS_MAP_CSV = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "yamnet_class_map.csv"
+)
+YAMNET_CHUNK_DURATION_S = 0.975
+YAMNET_CHUNK_SAMPLES = int(SAMPLE_RATE * YAMNET_CHUNK_DURATION_S)  # ~15 600 samples
+MUSIC_CONFIDENCE_THRESHOLD = 0.15
+MUSIC_SMOOTHING_WINDOW = 4
+MUSIC_RECORD_SECONDS = 7
+MUSIC_ACR_SAMPLE_RATE = 44_100
+MUSIC_OFF_GRACE_S = 5.0
+MUSIC_LABELS = {
+    "music",
+    "musical instrument",
+    "singing",
+    "song",
+    "guitar",
+    "piano",
+    "drum",
+    "bass",
+    "violin",
+    "orchestra",
+    "choir",
+    "beat",
+    "rhythm",
+    "pop music",
+    "rock music",
+    "hip hop",
+    "jazz",
+    "electronic music",
+    "classical music",
+    "dance music",
+}
+# -----------------------------------
 
 
 def _load_system_prompt() -> str:
@@ -380,6 +428,25 @@ mqtt_client = mqtt.Client(
 # TOPIC_SYSTEM_READY.  Used by on_connect so that if the MQTT broker
 # restarts (or the ESP32 reconnects) we re-announce readiness.
 _system_ready: bool = False
+
+# --- YAMNet / music detection shared state ---
+yamnet_queue: collections.deque = collections.deque()
+
+# Rolling buffer: last MUSIC_RECORD_SECONDS of float32 audio.
+# maxlen auto-drops the oldest samples when full — no manual trimming needed.
+_music_record_buffer: collections.deque = collections.deque(
+    maxlen=int(MUSIC_RECORD_SECONDS * SAMPLE_RATE)
+)
+
+_music_recent_flags: list[bool] = []
+_music_was_confirmed_off: bool = True  # True at startup so first detection triggers
+_music_off_since: float | None = None
+_music_identifying: bool = False
+_music_detect_lock = threading.Lock()
+
+# YAMNet model globals — populated in main() before threads start
+yamnet_interpreter = None
+yamnet_labels: list[str] = []
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
@@ -1193,6 +1260,187 @@ def audio_dispatch_loop() -> None:
         audio_queue_event.clear()
 
 
+# =============================================================================
+# YAMNet music detection
+# =============================================================================
+
+
+def _is_music_label(label_name: str) -> bool:
+    lower = label_name.lower()
+    return any(keyword in lower for keyword in MUSIC_LABELS)
+
+
+def _load_yamnet_class_map(csv_path: str) -> list[str]:
+    labels = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            labels.append(row["display_name"])
+    return labels
+
+
+def _yamnet_classify_chunk(pcm: np.ndarray) -> list[tuple[str, float]]:
+    """Run one YAMNet inference on a float32 PCM chunk (normalised to [-1, 1])."""
+    input_details = yamnet_interpreter.get_input_details()
+    output_details = yamnet_interpreter.get_output_details()
+    input_tensor = pcm.reshape(-1).astype(np.float32)
+    yamnet_interpreter.set_tensor(input_details[0]["index"], input_tensor)
+    yamnet_interpreter.invoke()
+    scores = yamnet_interpreter.get_tensor(output_details[0]["index"])
+    mean_scores = scores.mean(axis=0)
+    results = [
+        (yamnet_labels[i], float(mean_scores[i]))
+        for i in range(len(mean_scores))
+        if float(mean_scores[i]) >= MUSIC_CONFIDENCE_THRESHOLD
+    ]
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def _process_music_results(results: list[tuple[str, float]]) -> None:
+    """Update music on/off state, handle grace period, trigger ACRCloud on rising edge."""
+    global _music_was_confirmed_off, _music_off_since, _music_identifying
+
+    music_detected = any(_is_music_label(name) for name, _ in results)
+
+    with _music_detect_lock:
+        _music_recent_flags.append(music_detected)
+        if len(_music_recent_flags) > MUSIC_SMOOTHING_WINDOW:
+            _music_recent_flags.pop(0)
+        smoothed = (
+            sum(_music_recent_flags) / len(_music_recent_flags)
+            if _music_recent_flags
+            else 0.0
+        )
+        music_on = smoothed >= 0.5
+
+    now = time.time()
+
+    if not music_on:
+        if _music_off_since is None:
+            _music_off_since = now
+        elif (
+            now - _music_off_since
+        ) >= MUSIC_OFF_GRACE_S and not _music_was_confirmed_off:
+            _music_was_confirmed_off = True
+            print(f"{ts()} [music] No music (grace period elapsed).", flush=True)
+    else:
+        _music_off_since = None  # music back — reset off-timer
+
+    # Rising-edge: fire only when music comes ON after a confirmed-off period
+    if music_on and _music_was_confirmed_off and not _music_identifying:
+        _music_was_confirmed_off = False
+        _music_identifying = True
+        print(f"{ts()} [music] Music detected.", flush=True)
+        snapshot = np.array(list(_music_record_buffer), dtype=np.float32)
+        t = threading.Thread(target=_music_identify, args=(snapshot,), daemon=True)
+        t.start()
+
+
+def _music_identify(snapshot: np.ndarray) -> None:
+    """Resample the audio snapshot, save as WAV, and submit to ACRCloud."""
+    global _music_identifying
+
+    print(
+        f"{ts()} [music] Sending {MUSIC_RECORD_SECONDS}s clip to ACRCloud ...",
+        flush=True,
+    )
+
+    # Convert float32 [-1, 1] -> int16
+    pcm_int16 = np.clip(snapshot * 32768.0, -32768, 32767).astype(np.int16)
+
+    # Resample 16 000 Hz -> 44 100 Hz  (441/160 exact integer ratio)
+    resampled_float = scipy.signal.resample_poly(
+        pcm_int16.astype(np.float32), up=441, down=160
+    )
+    resampled_int16 = np.clip(resampled_float, -32768, 32767).astype(np.int16)
+
+    tmp_path = tempfile.mktemp(suffix=".wav")
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(MUSIC_ACR_SAMPLE_RATE)
+        wf.writeframes(resampled_int16.tobytes())
+
+    acrcloud_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "acrcloud.py"
+    )
+
+    try:
+        result = subprocess.run(
+            [sys.executable, acrcloud_script, tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        raw_output = result.stdout or result.stderr or "(no output)"
+
+        print("\n" + "-" * 60)
+        try:
+            data = json.loads(raw_output)
+            code = data.get("status", {}).get("code")
+            if code == 0:
+                music_meta = data["metadata"]["music"][0]
+                title = music_meta.get("title", "Unknown")
+                artists = ", ".join(
+                    a["name"] for a in music_meta.get("artists", [])
+                )
+                album = music_meta.get("album", {}).get("name", "Unknown")
+                print(f"{ts()} [music] Song identified!")
+                print(f"         Title  : {title}")
+                print(f"         Artist : {artists}")
+                print(f"         Album  : {album}")
+            elif code == 1001:
+                print(f"{ts()} [music] No match found.")
+            else:
+                msg = data.get("status", {}).get("msg", "")
+                print(f"{ts()} [music] ACRCloud code {code}: {msg}")
+        except (json.JSONDecodeError, KeyError):
+            print(raw_output)
+        print("-" * 60 + "\n")
+
+    except subprocess.TimeoutExpired:
+        print(f"{ts()} [music] ACRCloud request timed out.", flush=True)
+    except FileNotFoundError:
+        print(
+            f"{ts()} [music] acrcloud.py not found at {acrcloud_script}", flush=True
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        _music_identifying = False
+
+
+def yamnet_loop() -> None:
+    """Accumulate ESP32 audio packets and run YAMNet inference every ~975 ms."""
+    if RECORDING_MODE:
+        print(f"{ts()} [RECORDING MODE] yamnet_loop disabled.")
+        return
+
+    accumulator = np.zeros(0, dtype=np.float32)
+
+    while not shutdown_event.is_set():
+        chunk = None
+        with queue_lock:
+            if yamnet_queue:
+                chunk = yamnet_queue.popleft()
+
+        if chunk is None:
+            shutdown_event.wait(0.005)
+            continue
+
+        accumulator = np.concatenate([accumulator, chunk])
+
+        while len(accumulator) >= YAMNET_CHUNK_SAMPLES:
+            pcm = accumulator[:YAMNET_CHUNK_SAMPLES]
+            accumulator = accumulator[YAMNET_CHUNK_SAMPLES:]
+            results = _yamnet_classify_chunk(pcm)
+            _process_music_results(results)
+
+
 def receive_loop(sock: socket.socket) -> None:
     """Background thread: receive UDP packets and enqueue decoded audio."""
     expected_bytes = SAMPLES_PER_PKT * 2  # uint16 = 2 bytes each
@@ -1221,6 +1469,12 @@ def receive_loop(sock: socket.socket) -> None:
             vad_queue.append(audio)
             if len(vad_queue) > MAX_QUEUE_LEN * 4:
                 vad_queue.popleft()
+            yamnet_queue.append(audio)
+            if len(yamnet_queue) > MAX_QUEUE_LEN * 40:
+                yamnet_queue.popleft()
+
+        # Feed rolling record buffer — thread-safe deque (maxlen auto-drops old samples)
+        _music_record_buffer.extend(audio)
 
 
 def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
@@ -1329,7 +1583,7 @@ def warmup_llm() -> None:
 
 
 def main() -> None:
-    global ESP32_IP, piper_voice, tts_executor
+    global ESP32_IP, piper_voice, tts_executor, yamnet_interpreter, yamnet_labels
 
     if RECORDING_MODE:
         print(
@@ -1381,6 +1635,12 @@ def main() -> None:
         )
         print(f"{ts()} Piper loaded. TTS executor: {TTS_MAX_WORKERS} workers.")
 
+        print(f"{ts()} Loading YAMNet model...")
+        yamnet_labels = _load_yamnet_class_map(YAMNET_CLASS_MAP_CSV)
+        yamnet_interpreter = tflite.Interpreter(model_path=YAMNET_MODEL_PATH)
+        yamnet_interpreter.allocate_tensors()
+        print(f"{ts()} YAMNet model loaded.")
+
     # Start all background threads
     threads = []
     for target, args in [
@@ -1398,6 +1658,7 @@ def main() -> None:
             (tts_dispatcher_loop, ()),
             (audio_collector_loop, ()),
             (audio_dispatch_loop, ()),
+            (yamnet_loop, ()),
         ]:
             t = threading.Thread(target=target, args=args, daemon=True)
             t.start()
