@@ -1383,9 +1383,7 @@ def _music_identify(snapshot: np.ndarray) -> None:
             if code == 0:
                 music_meta = data["metadata"]["music"][0]
                 title = music_meta.get("title", "Unknown")
-                artists = ", ".join(
-                    a["name"] for a in music_meta.get("artists", [])
-                )
+                artists = ", ".join(a["name"] for a in music_meta.get("artists", []))
                 album = music_meta.get("album", {}).get("name", "Unknown")
                 print(f"{ts()} [music] Song identified!")
                 print(f"         Title  : {title}")
@@ -1403,9 +1401,7 @@ def _music_identify(snapshot: np.ndarray) -> None:
     except subprocess.TimeoutExpired:
         print(f"{ts()} [music] ACRCloud request timed out.", flush=True)
     except FileNotFoundError:
-        print(
-            f"{ts()} [music] acrcloud.py not found at {acrcloud_script}", flush=True
-        )
+        print(f"{ts()} [music] acrcloud.py not found at {acrcloud_script}", flush=True)
     finally:
         try:
             os.remove(tmp_path)
