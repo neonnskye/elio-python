@@ -42,6 +42,11 @@ DETECT_WIDTH = 320
 # playback over the network, at the cost of some visual quality.
 MJPEG_QUALITY = 70
 
+# Width to downscale the annotated frame to before sending over the MJPEG
+# stream. Capture/detection/enrollment all stay at full CAM_WIDTH resolution —
+# only the outgoing stream is shrunk, to cut bandwidth further.
+STREAM_WIDTH = 320
+
 # Persistent face database path
 FACES_DB = Path("faces_db.npz")
 
@@ -392,6 +397,17 @@ class FacialRecognition:
                 if frame is None:
                     time.sleep(0.01)
                     continue
+
+                # Annotated frame stays at full CAM_WIDTH/CAM_HEIGHT for
+                # detection/enrollment quality; only the outgoing stream
+                # copy is shrunk down to STREAM_WIDTH to save bandwidth.
+                h, w = frame.shape[:2]
+                if w > STREAM_WIDTH:
+                    stream_h = max(1, round(h * STREAM_WIDTH / w))
+                    frame = cv2.resize(
+                        frame, (STREAM_WIDTH, stream_h), interpolation=cv2.INTER_AREA
+                    )
+
                 ok, buf = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, MJPEG_QUALITY]
                 )
