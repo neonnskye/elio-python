@@ -1353,8 +1353,8 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
         if voice_pipeline_idle:
             mqtt_set_emotion("LOVE")
 
-        # Pick a random dance routine (1, 2, or 3) and start dancing immediately
-        dance_idx = random.randint(1, 3)
+        # Pick a random dance routine (1 through 6) and start dancing immediately
+        dance_idx = random.randint(1, 6)
         print(
             f"{ts()} [music] Music detected. Starting dance {dance_idx}...", flush=True
         )
