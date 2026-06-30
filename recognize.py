@@ -27,6 +27,21 @@ COSINE_THRESHOLD = 0.363  # below this → different person
 # Below this: reuse cached label (skip SFace CNN). Above: re-identify.
 MATCH_DIST_PX = 60
 
+# --- Performance tuning ---
+# Fixed capture resolution on both PC and Raspberry Pi.
+CAM_WIDTH = 640
+CAM_HEIGHT = 480
+CAM_FPS = 30
+
+# YuNet runs on a downscaled copy of the frame for speed; detections are
+# rescaled back up to full CAM_WIDTH x CAM_HEIGHT before use elsewhere
+# (annotation, alignCrop, enrollment all stay in full-res coordinates).
+DETECT_WIDTH = 320
+
+# JPEG quality for the MJPEG stream (0-100). Lower = smaller frames = smoother
+# playback over the network, at the cost of some visual quality.
+MJPEG_QUALITY = 70
+
 # Persistent face database path
 FACES_DB = Path("faces_db.npz")
 
@@ -71,22 +86,33 @@ class FacialRecognition:
             self._picam = Picamera2()
             # RGB888 gives us a plain HxWx3 uint8 array; we convert to BGR for OpenCV.
             config = self._picam.create_video_configuration(
-                main={"format": "RGB888", "size": (1280, 720)}
+                main={"format": "RGB888", "size": (CAM_WIDTH, CAM_HEIGHT)},
+                controls={"FrameRate": CAM_FPS},
             )
             self._picam.configure(config)
             self._picam.start()
             self._cap = None
-            print("Camera: picamera2 (Raspberry Pi)")
+            print(
+                f"Camera: picamera2 (Raspberry Pi) @ {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}"
+            )
         else:
             self._picam = None
             self._cap = cv2.VideoCapture(3)  # OBS Virtual Camera
-            print("Camera: OpenCV VideoCapture (Windows)")
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+            self._cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+            print(
+                f"Camera: OpenCV VideoCapture (Windows) @ {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}"
+            )
 
         # --- YuNet detector ---
+        # Initial inputSize is set to the downscaled detection resolution;
+        # _detect_faces() calls setInputSize() per-frame anyway, but this
+        # gives a sane default matching how it's actually used.
         self._detector = cv2.FaceDetectorYN.create(
             YUNET_MODEL,
             "",
-            (320, 320),
+            (DETECT_WIDTH, round(DETECT_WIDTH * CAM_HEIGHT / CAM_WIDTH)),
             score_threshold=0.6,
             nms_threshold=0.3,
             top_k=5000,
@@ -189,11 +215,42 @@ class FacialRecognition:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _detect_faces(self, frame: np.ndarray):
+        """Run YuNet on a downscaled copy of `frame` for speed, then rescale
+        the resulting boxes/landmarks back up to the original frame's
+        coordinate space. Returns the same `faces` array shape that
+        detector.detect() would, just computed faster on a smaller image.
+        """
+        h, w = frame.shape[:2]
+
+        if w <= DETECT_WIDTH:
+            # Already small enough — detect at full res, no scaling needed.
+            self._detector.setInputSize((w, h))
+            _, faces = self._detector.detect(frame)
+            return faces
+
+        scale = DETECT_WIDTH / w
+        small_w = DETECT_WIDTH
+        small_h = max(1, round(h * scale))
+        small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+
+        self._detector.setInputSize((small_w, small_h))
+        _, faces = self._detector.detect(small)
+
+        if faces is None or len(faces) == 0:
+            return faces
+
+        # Rescale all columns except the last (the detection confidence score)
+        # back up to full-frame coordinates. Columns are: x, y, w, h, then 5
+        # landmark (x, y) pairs, then score.
+        faces = faces.copy()
+        inv_scale = 1.0 / scale
+        faces[:, :-1] *= inv_scale
+        return faces
+
     def _get_embedding(self, frame: np.ndarray) -> np.ndarray | None:
         """Detect first face in frame and return its SFace embedding."""
-        h, w = frame.shape[:2]
-        self._detector.setInputSize((w, h))
-        _, faces = self._detector.detect(frame)
+        faces = self._detect_faces(frame)
         if faces is None or len(faces) == 0:
             return None
         aligned = self._recognizer.alignCrop(frame, faces[0])
@@ -287,9 +344,7 @@ class FacialRecognition:
     # ------------------------------------------------------------------
     def _process_frame(self, frame: np.ndarray):
         """Run detection + annotation on one frame and stash results."""
-        h, w = frame.shape[:2]
-        self._detector.setInputSize((w, h))
-        _, faces = self._detector.detect(frame)
+        faces = self._detect_faces(frame)
 
         # Stash the *raw* frame + detection result before annotation so
         # enroll_from_frame can reuse this exact detection (no race).
@@ -337,7 +392,9 @@ class FacialRecognition:
                 if frame is None:
                     time.sleep(0.01)
                     continue
-                ok, buf = cv2.imencode(".jpg", frame)
+                ok, buf = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, MJPEG_QUALITY]
+                )
                 if not ok:
                     time.sleep(0.01)
                     continue
