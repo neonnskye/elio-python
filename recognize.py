@@ -58,7 +58,7 @@ TOPIC_ROBOT_CMD = "luna/robot/cmd"  # payload: robot drive/mode commands
 
 MODE_MANUAL = "MODE-2"
 CMD_FORWARD = "MANUAL:FORWARD"
-CMD_STOP = "MANUAL:BACKWARD"
+CMD_STOP = "MANUAL:STOP"
 
 # Number of consecutive frames a known face must be seen in before we
 # trigger the forward-drive command (debounces flicker/misidentification).
