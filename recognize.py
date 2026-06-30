@@ -54,6 +54,15 @@ FACES_DB = Path("faces_db.npz")
 MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
+TOPIC_ROBOT_CMD = "luna/robot/cmd"  # payload: robot drive/mode commands
+
+MODE_MANUAL = "MODE-2"
+CMD_FORWARD = "MANUAL:FORWARD"
+CMD_STOP = "MANUAL:BACKWARD"
+
+# Number of consecutive frames a known face must be seen in before we
+# trigger the forward-drive command (debounces flicker/misidentification).
+FORWARD_TRIGGER_FRAMES = 3
 
 _mqtt_client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -71,6 +80,13 @@ def _mqtt_publish(topic: str, payload: str) -> None:
         _mqtt_client.publish(topic, payload)
     except Exception as exc:
         print(f"[MQTT] Publish failed ({topic!r} {payload!r}): {exc}", flush=True)
+
+
+def _send_robot_drive_cmd(payload: str) -> None:
+    """Switch the robot into manual control mode, then send a drive command.
+    Mirrors receiver.py's pattern of sending MODE-2 before any MANUAL:* cmd."""
+    _mqtt_publish(TOPIC_ROBOT_CMD, MODE_MANUAL)
+    _mqtt_publish(TOPIC_ROBOT_CMD, payload)
 
 
 # ---------------
@@ -139,6 +155,11 @@ class FacialRecognition:
         # session.  Reset only when the process restarts, so each person gets
         # greeted at most once per run.
         self._greeted: set[str] = set()
+        # Consecutive-frame counter for "a known face is currently visible",
+        # and whether we've already told the robot to drive forward as a
+        # result (so we send FORWARD/STOP exactly once on each transition).
+        self._known_face_streak: int = 0
+        self._robot_driving: bool = False
         self._load_db()
 
     # ------------------------------------------------------------------
@@ -277,6 +298,27 @@ class FacialRecognition:
             return "Unknown"
         return f"{best_name} ({best_score:.2f})"
 
+    def _update_robot_drive_state(self, known_face_present: bool) -> None:
+        """Called once per processed frame with whether a known face is
+        currently visible anywhere in frame. Drives the robot forward after
+        FORWARD_TRIGGER_FRAMES consecutive frames with a known face, and
+        stops it as soon as no known face is visible."""
+        if known_face_present:
+            self._known_face_streak += 1
+            if (
+                self._known_face_streak >= FORWARD_TRIGGER_FRAMES
+                and not self._robot_driving
+            ):
+                self._robot_driving = True
+                _send_robot_drive_cmd(CMD_FORWARD)
+                print("[ROBOT] Known face confirmed — sending FORWARD", flush=True)
+        else:
+            self._known_face_streak = 0
+            if self._robot_driving:
+                self._robot_driving = False
+                _send_robot_drive_cmd(CMD_STOP)
+                print("[ROBOT] Known face lost — sending STOP", flush=True)
+
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
         """Draw bounding boxes and identity labels on frame.
 
@@ -286,6 +328,7 @@ class FacialRecognition:
         """
         if faces is None:
             self._tracked_faces = []
+            self._update_robot_drive_state(False)
             return frame
 
         # If the face DB was updated since we last ran (e.g. a new enroll),
@@ -296,6 +339,7 @@ class FacialRecognition:
 
         new_tracked: list[tuple[float, float, str]] = []
         used: set[int] = set()
+        known_face_present = False
 
         for face in faces:
             x, y, w, h = (int(v) for v in face[:4])
@@ -326,6 +370,7 @@ class FacialRecognition:
 
             # Fire MQTT exactly once per session for each known face.
             if not label.startswith("Unknown"):
+                known_face_present = True
                 # label is "<DisplayName> (0.xx)" — extract just the name part.
                 display_name = label.rsplit(" (", 1)[0]
                 if display_name not in self._greeted:
@@ -342,6 +387,7 @@ class FacialRecognition:
             )
 
         self._tracked_faces = new_tracked
+        self._update_robot_drive_state(known_face_present)
         return frame
 
     # ------------------------------------------------------------------
