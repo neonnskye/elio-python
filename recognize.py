@@ -55,10 +55,14 @@ MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
 TOPIC_ROBOT_CMD = "luna/robot/cmd"  # payload: robot drive/mode commands
+TOPIC_ROBOT_EMOTION = "luna/robot/emotion"  # payload: OLED emotion name
 
 MODE_MANUAL = "MODE-2"
 CMD_FORWARD = "MANUAL:FORWARD"
 CMD_STOP = "MANUAL:STOP"
+
+EMOTION_KNOWN_FACE = "LOVE"
+EMOTION_DEFAULT = "HAPPY"
 
 # Number of consecutive frames a known face must be seen in before we
 # trigger the forward-drive command (debounces flicker/misidentification).
@@ -311,13 +315,18 @@ class FacialRecognition:
             ):
                 self._robot_driving = True
                 _send_robot_drive_cmd(CMD_FORWARD)
-                print("[ROBOT] Known face confirmed — sending FORWARD", flush=True)
+                _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_KNOWN_FACE)
+                print(
+                    "[ROBOT] Known face confirmed — sending FORWARD + LOVE",
+                    flush=True,
+                )
         else:
             self._known_face_streak = 0
             if self._robot_driving:
                 self._robot_driving = False
                 _send_robot_drive_cmd(CMD_STOP)
-                print("[ROBOT] Known face lost — sending STOP", flush=True)
+                _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_DEFAULT)
+                print("[ROBOT] Known face lost — sending STOP + HAPPY", flush=True)
 
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
         """Draw bounding boxes and identity labels on frame.
