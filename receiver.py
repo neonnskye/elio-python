@@ -9,9 +9,7 @@ import queue
 import random
 import re
 import socket
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import wave
@@ -110,9 +108,6 @@ YAMNET_CHUNK_DURATION_S = 0.975
 YAMNET_CHUNK_SAMPLES = int(SAMPLE_RATE * YAMNET_CHUNK_DURATION_S)  # ~15 600 samples
 MUSIC_CONFIDENCE_THRESHOLD = 0.15
 MUSIC_SMOOTHING_WINDOW = 4
-MUSIC_RECORD_SECONDS = 7
-MUSIC_ACR_SAMPLE_RATE = 44_100
-MUSIC_OFF_GRACE_S = 5.0
 MUSIC_LABELS = {
     "music",
     "musical instrument",
@@ -433,16 +428,8 @@ _system_ready: bool = False
 # --- YAMNet / music detection shared state ---
 yamnet_queue: collections.deque = collections.deque()
 
-# Rolling buffer: last MUSIC_RECORD_SECONDS of float32 audio.
-# maxlen auto-drops the oldest samples when full — no manual trimming needed.
-_music_record_buffer: collections.deque = collections.deque(
-    maxlen=int(MUSIC_RECORD_SECONDS * SAMPLE_RATE)
-)
-
 _music_recent_flags: list[bool] = []
 _music_was_confirmed_off: bool = True  # True at startup so first detection triggers
-_music_off_since: float | None = None
-_music_identifying: bool = False
 _music_detect_lock = threading.Lock()
 
 # YAMNet model globals — populated in main() before threads start
@@ -1325,8 +1312,10 @@ def _yamnet_classify_chunk(pcm: np.ndarray) -> list[tuple[str, float]]:
 
 
 def _process_music_results(results: list[tuple[str, float]]) -> None:
-    """Update music on/off state, handle grace period, trigger ACRCloud on rising edge."""
-    global _music_was_confirmed_off, _music_off_since, _music_identifying
+    """Update music on/off state straight off the smoothed YAMNet flag and
+    fire MQTT dance/emotion commands on state transitions. No grace period,
+    no recording, no external recognition — just on/off."""
+    global _music_was_confirmed_off
 
     music_detected = any(_is_music_label(name) for name, _ in results)
 
@@ -1341,16 +1330,10 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
         )
         music_on = smoothed >= 0.5
 
-    now = time.time()
-
     if not music_on:
-        if _music_off_since is None:
-            _music_off_since = now
-        elif (
-            now - _music_off_since
-        ) >= MUSIC_OFF_GRACE_S and not _music_was_confirmed_off:
+        if not _music_was_confirmed_off:
             _music_was_confirmed_off = True
-            print(f"{ts()} [music] No music (grace period elapsed).", flush=True)
+            print(f"{ts()} [music] No music detected.", flush=True)
             print(f"{ts()} [music] Stopping movement / dance.", flush=True)
             with state_lock:
                 voice_pipeline_idle = listen_state == ListenState.IDLE
@@ -1359,11 +1342,10 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
             mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
             time.sleep(0.05)
             mqtt_publish(TOPIC_ROBOT_CMD, "MANUAL:STOP")
-    else:
-        _music_off_since = None  # music back — reset off-timer
+        return
 
     # Rising-edge: fire only when music comes ON after a confirmed-off period
-    if music_on and _music_was_confirmed_off:
+    if _music_was_confirmed_off:
         _music_was_confirmed_off = False
 
         with state_lock:
@@ -1379,85 +1361,6 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
         mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
         time.sleep(0.05)
         mqtt_publish(TOPIC_ROBOT_CMD, f"DANCE:{dance_idx}")
-
-        if not _music_identifying:
-            _music_identifying = True
-            snapshot = np.array(list(_music_record_buffer), dtype=np.float32)
-            t = threading.Thread(target=_music_identify, args=(snapshot,), daemon=True)
-            t.start()
-
-
-def _music_identify(snapshot: np.ndarray) -> None:
-    """Resample the audio snapshot, save as WAV, and submit to ACRCloud."""
-    global _music_identifying
-
-    print(
-        f"{ts()} [music] Sending {MUSIC_RECORD_SECONDS}s clip to ACRCloud ...",
-        flush=True,
-    )
-
-    # Convert float32 [-1, 1] -> int16
-    pcm_int16 = np.clip(snapshot * 32768.0, -32768, 32767).astype(np.int16)
-
-    # Resample 16 000 Hz -> 44 100 Hz  (441/160 exact integer ratio)
-    resampled_float = scipy.signal.resample_poly(
-        pcm_int16.astype(np.float32), up=441, down=160
-    )
-    resampled_int16 = np.clip(resampled_float, -32768, 32767).astype(np.int16)
-
-    tmp_path = tempfile.mktemp(suffix=".wav")
-    with wave.open(tmp_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(MUSIC_ACR_SAMPLE_RATE)
-        wf.writeframes(resampled_int16.tobytes())
-
-    acrcloud_script = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "acrcloud.py"
-    )
-
-    try:
-        result = subprocess.run(
-            [sys.executable, acrcloud_script, tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-        )
-        raw_output = result.stdout or result.stderr or "(no output)"
-
-        print("\n" + "-" * 60)
-        try:
-            data = json.loads(raw_output)
-            code = data.get("status", {}).get("code")
-            if code == 0:
-                music_meta = data["metadata"]["music"][0]
-                title = music_meta.get("title", "Unknown")
-                artists = ", ".join(a["name"] for a in music_meta.get("artists", []))
-                album = music_meta.get("album", {}).get("name", "Unknown")
-                print(f"{ts()} [music] Song identified!")
-                print(f"         Title  : {title}")
-                print(f"         Artist : {artists}")
-                print(f"         Album  : {album}")
-            elif code == 1001:
-                print(f"{ts()} [music] No match found.")
-            else:
-                msg = data.get("status", {}).get("msg", "")
-                print(f"{ts()} [music] ACRCloud code {code}: {msg}")
-        except (json.JSONDecodeError, KeyError):
-            print(raw_output)
-        print("-" * 60 + "\n")
-
-    except subprocess.TimeoutExpired:
-        print(f"{ts()} [music] ACRCloud request timed out.", flush=True)
-    except FileNotFoundError:
-        print(f"{ts()} [music] acrcloud.py not found at {acrcloud_script}", flush=True)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        _music_identifying = False
 
 
 def yamnet_loop() -> None:
@@ -1518,9 +1421,6 @@ def receive_loop(sock: socket.socket) -> None:
             yamnet_queue.append(audio)
             if len(yamnet_queue) > MAX_QUEUE_LEN * 40:
                 yamnet_queue.popleft()
-
-        # Feed rolling record buffer — thread-safe deque (maxlen auto-drops old samples)
-        _music_record_buffer.extend(audio)
 
 
 def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
