@@ -269,6 +269,7 @@ TOPIC_TRANSCRIPT_ASST = "elio/transcript/assistant"
 TOPIC_SYSTEM_READY = "elio/system/ready"
 TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
+TOPIC_ROBOT_EMOTION = "luna/robot/emotion"
 
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
@@ -532,6 +533,7 @@ def on_mqtt_message(client, userdata, msg) -> None:
         bleed_remaining = BLEED_SKIP_PACKETS
 
     mqtt_publish(TOPIC_STATE, "listening")
+    mqtt_set_emotion("LISTENING")
 
     print(
         f"\n{ts()} [WAKE] Wake word received via MQTT! "
@@ -628,6 +630,7 @@ def vad_accumulator_loop() -> None:
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
                     mqtt_publish(TOPIC_STATE, "transcribing")
+                    mqtt_set_emotion("THINKING")
                     transcribe_queue.put(segment)
                     # Turn off the listen LED — user has finished speaking.
                     # 0x03 doubles as chime-stop; at this point the chime loop
@@ -997,6 +1000,26 @@ def mqtt_publish_retained(topic: str, payload: str) -> None:
         )
 
 
+# ---- OLED emotion state ----
+# Tracks the last emotion we *intentionally* sent so repeated triggers (e.g.
+# "speaking" firing once per TTS sentence) don't spam duplicate MQTT publishes.
+_current_emotion = "HAPPY"
+_emotion_lock = threading.Lock()
+
+
+def mqtt_set_emotion(emotion: str) -> None:
+    """Publish an OLED emotion to luna/robot/emotion, deduped against the
+    last emotion we sent so repeated triggers within the same state don't
+    spam the broker / restart the ESP32-side animation needlessly."""
+    global _current_emotion
+    with _emotion_lock:
+        if emotion == _current_emotion:
+            return
+        _current_emotion = emotion
+    mqtt_publish(TOPIC_ROBOT_EMOTION, emotion)
+    print(f"{ts()} [emotion] -> {emotion}", flush=True)
+
+
 def reset_to_idle(reason: str = "") -> None:
     """
     Reset Python state and always tell ESP32 to turn off LED/chime.
@@ -1024,6 +1047,9 @@ def reset_to_idle(reason: str = "") -> None:
     with state_lock:
         listen_state = ListenState.IDLE
     mqtt_publish(TOPIC_STATE, "idle")
+    # If music is still playing, fall back to LOVE instead of HAPPY —
+    # _music_was_confirmed_off is False whenever music is currently "on".
+    mqtt_set_emotion("HAPPY" if _music_was_confirmed_off else "LOVE")
 
     if reason:
         print(f"{ts()} [STATE] Reset to IDLE: {reason}")
@@ -1256,6 +1282,7 @@ def audio_dispatch_loop() -> None:
                 reset_to_idle("ESP32 playback finished")
             else:
                 mqtt_publish(TOPIC_STATE, "speaking")
+                mqtt_set_emotion("HAPPY")
                 play_audio(item)
         audio_queue_event.clear()
 
@@ -1325,6 +1352,10 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
             _music_was_confirmed_off = True
             print(f"{ts()} [music] No music (grace period elapsed).", flush=True)
             print(f"{ts()} [music] Stopping movement / dance.", flush=True)
+            with state_lock:
+                voice_pipeline_idle = listen_state == ListenState.IDLE
+            if voice_pipeline_idle:
+                mqtt_set_emotion("HAPPY")
             mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
             time.sleep(0.05)
             mqtt_publish(TOPIC_ROBOT_CMD, "MANUAL:STOP")
@@ -1334,6 +1365,11 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
     # Rising-edge: fire only when music comes ON after a confirmed-off period
     if music_on and _music_was_confirmed_off:
         _music_was_confirmed_off = False
+
+        with state_lock:
+            voice_pipeline_idle = listen_state == ListenState.IDLE
+        if voice_pipeline_idle:
+            mqtt_set_emotion("LOVE")
 
         # Pick a random dance routine (1, 2, or 3) and start dancing immediately
         dance_idx = random.randint(1, 3)
