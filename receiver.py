@@ -265,6 +265,7 @@ TOPIC_SYSTEM_READY = "elio/system/ready"
 TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"
+TOPIC_FACE_SEEN = "elio/face/seen"  # payload: display name of the recognised person
 
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
@@ -442,6 +443,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
     if reason_code == 0:
         print(f"{ts()} [MQTT] Connected to broker.", flush=True)
         client.subscribe(TOPIC_WAKE)
+        client.subscribe(TOPIC_FACE_SEEN)
         if _system_ready:
             # Re-publish so an ESP32 that restarted while we were up gets the signal
             client.publish(TOPIC_SYSTEM_READY, "1", retain=True)
@@ -494,9 +496,19 @@ _WAKE_COOLDOWN_S: float = 1.5
 
 def on_mqtt_message(client, userdata, msg) -> None:
     """MQTT callback — fires when a message arrives on any subscribed topic.
-    Replaces control_listener(). Currently handles elio/wake only.
+    Replaces control_listener(). Handles elio/wake and elio/face/seen.
     """
     global listen_state, bleed_remaining, _last_wake_time
+
+    if msg.topic == TOPIC_FACE_SEEN:
+        if RECORDING_MODE:
+            return
+        try:
+            name = msg.payload.decode("utf-8")
+        except Exception:
+            return
+        handle_face_seen(name)
+        return
 
     if msg.topic != TOPIC_WAKE:
         return
@@ -1069,6 +1081,69 @@ def play_audio(pcm_int16: np.ndarray) -> None:
         # Local playback is non-blocking (just queues), so run it first
         play_audio_local(pcm_int16)
         send_audio_esp32(pcm_int16)
+
+
+# =============================================================================
+# Face-recognition greetings
+# =============================================================================
+# Triggered by recognize.py publishing a display name to elio/face/seen.
+# No LLM round-trip — just pick a random template, drop in the name, and
+# synthesize/play immediately.
+
+FACE_GREETINGS = [
+    "Hello, {name}!",
+    "Hey, {name}! Good to see you.",
+    "Hi there, {name}!",
+    "Well hello, {name}!",
+    "{name}! Great to see you.",
+    "Oh, hey {name}!",
+    "Look who it is — {name}!",
+]
+
+
+def handle_face_seen(name: str) -> None:
+    """Handle an `elio/face/seen` MQTT message.
+
+    Picks a random greeting template, fills in the name, synthesizes it via
+    Piper, and streams it straight to the ESP32 — bypassing the LLM and the
+    tts_queue/audio_collector pipeline entirely, since this doesn't need a
+    conversational round trip.
+    """
+    name = name.strip()
+    if not name:
+        return
+
+    # Don't interrupt an active wake-word conversation with a greeting.
+    with state_lock:
+        if listen_state != ListenState.IDLE:
+            print(
+                f"{ts()} [FACE] Saw {name!r} but pipeline is busy "
+                f"({listen_state.name}) — skipping greeting.",
+                flush=True,
+            )
+            return
+
+    if piper_voice is None:
+        # TTS not loaded yet (e.g. still starting up) — nothing to do.
+        return
+
+    greeting = random.choice(FACE_GREETINGS).format(name=name)
+    print(f"{ts()} [FACE] Saw {name!r} — greeting: {greeting!r}", flush=True)
+
+    def _greet() -> None:
+        try:
+            pcm_int16 = synthesize_text(greeting)
+            mqtt_set_emotion("LOVE")
+            play_audio(pcm_int16)
+        except Exception as exc:
+            print(
+                f"{ts()} [FACE] Greeting synthesis/playback failed: {exc}", flush=True
+            )
+
+    if tts_executor is not None:
+        tts_executor.submit(_greet)
+    else:
+        threading.Thread(target=_greet, daemon=True).start()
 
 
 # =============================================================================
