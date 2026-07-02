@@ -45,7 +45,7 @@ MJPEG_QUALITY = 70
 # Width to downscale the annotated frame to before sending over the MJPEG
 # stream. Capture/detection/enrollment all stay at full CAM_WIDTH resolution —
 # only the outgoing stream is shrunk, to cut bandwidth further.
-STREAM_WIDTH = 320
+STREAM_WIDTH = 640
 
 # Persistent face database path
 FACES_DB = Path("faces_db.npz")
