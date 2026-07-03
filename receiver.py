@@ -1161,6 +1161,19 @@ TTS_MAX_WORKERS = 2  # Piper/ONNX releases the GIL, so 2 workers helps on multi-
 # Global Piper voice handle — loaded in main() before threads start
 piper_voice: PiperVoice | None = None
 
+
+def _load_piper_voice() -> None:
+    """Load the Piper TTS voice model.
+
+    Runs inside the parallel model-loading pool in main() alongside Silero
+    VAD and YAMNet — Piper loading is independent of those, so there's no
+    reason to block on it sequentially.
+    """
+    global piper_voice
+    print(f"{ts()} Loading Piper TTS voice...", flush=True)
+    piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+    print(f"{ts()} Piper TTS voice loaded.", flush=True)
+
 # Monotonic sequence counter for sentences within a turn (resets each turn via
 # the done-sentinel logic in audio_collector_loop)
 tts_sequence = 0
@@ -1366,6 +1379,22 @@ def _load_yamnet_class_map(csv_path: str) -> list[str]:
         for row in reader:
             labels.append(row["display_name"])
     return labels
+
+
+def _load_yamnet() -> None:
+    """Load the YAMNet label map and TFLite interpreter.
+
+    Runs inside the parallel model-loading pool in main() alongside Silero
+    VAD and Piper — YAMNet loading is independent of those.
+    """
+    global yamnet_interpreter, yamnet_labels
+    print(f"{ts()} Loading YAMNet model...", flush=True)
+    labels = _load_yamnet_class_map(YAMNET_CLASS_MAP_CSV)
+    interpreter = tflite.Interpreter(model_path=YAMNET_MODEL_PATH)
+    interpreter.allocate_tensors()
+    yamnet_labels = labels
+    yamnet_interpreter = interpreter
+    print(f"{ts()} YAMNet model loaded.", flush=True)
 
 
 def _yamnet_classify_chunk(pcm: np.ndarray) -> list[tuple[str, float]]:
@@ -1614,13 +1643,40 @@ def main() -> None:
         print(
             f"{ts()} Using Groq STT model '{GROQ_MODEL}', Piper TTS model '{PIPER_MODEL_PATH}'"
         )
-        load_silero_vad()
 
     # Broadcast this machine as raspberrypi.local (Windows: via zeroconf; Linux: via avahi)
     ensure_mdns_broadcast("raspberrypi")
 
-    # Resolve ESP32's mDNS hostname to an IP for sending TTS audio back
-    ESP32_IP = resolve_mdns(ESP32_MDNS_HOST)
+    # Kick off ESP32 mDNS resolution in the background immediately — it waits
+    # on the ESP32 to come online, which has nothing to do with loading our
+    # own models, so there's no reason to block model loading on it. We only
+    # join this thread right before we actually need ESP32_IP (opening the
+    # output stream, near the end of main()).
+    esp32_ip_result: dict[str, str] = {}
+
+    def _resolve_esp32_ip() -> None:
+        esp32_ip_result["ip"] = resolve_mdns(ESP32_MDNS_HOST)
+
+    mdns_thread = threading.Thread(target=_resolve_esp32_ip, daemon=True)
+    mdns_thread.start()
+
+    if not RECORDING_MODE:
+        # Silero VAD, Piper TTS, and YAMNet don't depend on each other, so
+        # load them concurrently instead of one after another — this is
+        # usually the biggest chunk of startup wall-clock time.
+        print(
+            f"{ts()} Loading Silero VAD, Piper TTS, and YAMNet models in parallel...",
+            flush=True,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as loader_pool:
+            model_futures = [
+                loader_pool.submit(load_silero_vad),
+                loader_pool.submit(_load_piper_voice),
+                loader_pool.submit(_load_yamnet),
+            ]
+            for future in concurrent.futures.as_completed(model_futures):
+                future.result()  # re-raise any exception from the loader threads
+        print(f"{ts()} All models loaded.", flush=True)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
@@ -1647,20 +1703,13 @@ def main() -> None:
     mqtt_send_ctrl("stop")
     print(f"{ts()} Sent startup 'stop' to clear any stale LED/chime state.")
 
-    # Load Piper voice and create TTS executor before spawning worker threads
+    # Piper and YAMNet were already loaded above in the parallel model-loading
+    # pool. Just spin up the TTS executor now that piper_voice is ready.
     if not RECORDING_MODE:
-        print(f"{ts()} Loading Piper TTS voice...")
-        piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
         tts_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=TTS_MAX_WORKERS
         )
-        print(f"{ts()} Piper loaded. TTS executor: {TTS_MAX_WORKERS} workers.")
-
-        print(f"{ts()} Loading YAMNet model...")
-        yamnet_labels = _load_yamnet_class_map(YAMNET_CLASS_MAP_CSV)
-        yamnet_interpreter = tflite.Interpreter(model_path=YAMNET_MODEL_PATH)
-        yamnet_interpreter.allocate_tensors()
-        print(f"{ts()} YAMNet model loaded.")
+        print(f"{ts()} TTS executor ready: {TTS_MAX_WORKERS} workers.")
 
     # Start all background threads
     threads = []
@@ -1704,6 +1753,13 @@ def main() -> None:
     # retained=True so any ESP32 that connects (or reconnects) later sees it immediately
     mqtt_publish_retained(TOPIC_SYSTEM_READY, "1")
     print(f"{ts()} ESP32 audio flowing — system ready. Press Ctrl+C to stop.")
+
+    # We need ESP32_IP from here on (audio_dispatch_loop uses it to send TTS
+    # audio back to the ESP32) so block on the background mDNS resolution now
+    # if it hasn't finished already.
+    mdns_thread.join()
+    ESP32_IP = esp32_ip_result["ip"]
+
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
