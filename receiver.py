@@ -22,6 +22,7 @@ import paho.mqtt.client as mqtt
 import scipy.signal
 import sounddevice as sd
 import torch
+from silero_vad import load_silero_vad as _load_silero_vad_model
 
 try:
     import tflite_runtime.interpreter as tflite  # Raspberry Pi
@@ -476,15 +477,15 @@ vad_model = None
 
 
 def load_silero_vad() -> None:
-    """Load the Silero VAD model at startup."""
+    """Load the Silero VAD model at startup.
+
+    Uses the `silero-vad` pip package instead of torch.hub.load(), which
+    loads the model straight from local files bundled with the package —
+    no network round-trip / GitHub cache check, even on the first run.
+    """
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
-    model, _ = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        trust_repo=True,
-    )
+    model = _load_silero_vad_model()
     model.eval()
     vad_model = model
     print(f"{ts()} Silero VAD model loaded.", flush=True)
@@ -1734,7 +1735,11 @@ def main() -> None:
             t.start()
             threads.append(t)
 
-        warmup_llm()
+        # warmup_llm() is a network round-trip to DeepSeek — fire it in a
+        # background thread instead of blocking here, so we can move straight
+        # on to waiting for ESP32 audio while the cache-priming call is
+        # in flight.
+        threading.Thread(target=warmup_llm, daemon=True).start()
 
         print(
             f"{ts()} Waiting for audio from ESP32 ({PREBUFFER_PKTS} packets to pre-buffer)..."
