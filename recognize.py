@@ -57,8 +57,9 @@ TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognise
 TOPIC_ROBOT_CMD = "luna/robot/cmd"  # payload: robot drive/mode commands
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"  # payload: OLED emotion name
 
-CMD_FORWARD = "FACE_FOLLOW:FACE_FORWARD"
-CMD_STOP = "FACE_FOLLOW:STOP"
+MODE_MANUAL = "MODE-2"
+CMD_FORWARD = "MANUAL:FORWARD"
+CMD_STOP = "MANUAL:STOP"
 
 EMOTION_KNOWN_FACE = "LOVE"
 EMOTION_DEFAULT = "HAPPY"
@@ -86,7 +87,9 @@ def _mqtt_publish(topic: str, payload: str) -> None:
 
 
 def _send_robot_drive_cmd(payload: str) -> None:
-    """Send a face-follow drive command to the robot."""
+    """Switch the robot into manual control mode, then send a drive command.
+    Mirrors receiver.py's pattern of sending MODE-2 before any MANUAL:* cmd."""
+    _mqtt_publish(TOPIC_ROBOT_CMD, MODE_MANUAL)
     _mqtt_publish(TOPIC_ROBOT_CMD, payload)
 
 
