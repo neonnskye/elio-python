@@ -479,7 +479,7 @@ def load_silero_vad() -> None:
     """
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
-    model = _load_silero_vad_model()
+    model = _load_silero_vad_model(onnx=True)
     model.eval()
     vad_model = model
     print(f"{ts()} Silero VAD model loaded.", flush=True)
