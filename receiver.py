@@ -470,7 +470,8 @@ vad_model = None
 
 
 _SILERO_VAD_JIT_URL = (
-    "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.jit"
+    "https://raw.githubusercontent.com/snakers4/silero-vad/master/"
+    "src/silero_vad/data/silero_vad.jit"
 )
 
 
