@@ -22,17 +22,11 @@ import paho.mqtt.client as mqtt
 import scipy.signal
 import sounddevice as sd
 import torch
-from silero_vad import load_silero_vad as _load_silero_vad_model
-
-try:
-    import tflite_runtime.interpreter as tflite  # Raspberry Pi
-except ModuleNotFoundError:
-    import tensorflow as tf  # Windows / Mac
-
-    tflite = tf.lite
+from ai_edge_litert import interpreter as tflite
 from groq import Groq
 from openai import OpenAI
 from piper import PiperVoice
+from silero_vad import load_silero_vad as _load_silero_vad_model
 
 from context import get_llm_context
 
@@ -1174,6 +1168,7 @@ def _load_piper_voice() -> None:
     print(f"{ts()} Loading Piper TTS voice...", flush=True)
     piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
     print(f"{ts()} Piper TTS voice loaded.", flush=True)
+
 
 # Monotonic sequence counter for sentences within a turn (resets each turn via
 # the done-sentinel logic in audio_collector_loop)
