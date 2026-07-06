@@ -469,20 +469,32 @@ MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 vad_model = None
 
 
+_SILERO_VAD_JIT_URL = (
+    "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.jit"
+)
+
+
 def load_silero_vad() -> None:
     """Load the Silero VAD model at startup.
 
-    Uses torch.hub.load() to fetch/cache the model, since the `silero-vad`
-    pip package (onnx-based) doesn't work reliably on Raspberry Pi.
+    We download the raw TorchScript (.jit) model file and load it directly
+    with torch.jit.load(), instead of going through torch.hub.load(). The
+    repo's hubconf.py unconditionally imports the vendored `silero_vad`
+    package, which imports torchaudio for its read_audio/save_audio helpers
+    (that we don't use) — and torchaudio's compiled extension fails to load
+    on the Pi (missing libcudart, since it's a CUDA-linked build with no GPU
+    present). Loading the .jit file directly sidesteps that import chain
+    entirely; it's exactly what torch.hub's init_jit_model() does under the
+    hood anyway, minus the torchaudio dependency.
     """
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
-    model, _utils = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        onnx=False,
-    )
+    cache_dir = os.path.join(torch.hub.get_dir(), "silero_vad")
+    os.makedirs(cache_dir, exist_ok=True)
+    jit_path = os.path.join(cache_dir, "silero_vad.jit")
+    if not os.path.exists(jit_path):
+        torch.hub.download_url_to_file(_SILERO_VAD_JIT_URL, jit_path)
+    model = torch.jit.load(jit_path, map_location="cpu")
     model.eval()
     vad_model = model
     print(f"{ts()} Silero VAD model loaded.", flush=True)
