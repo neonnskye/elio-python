@@ -26,7 +26,6 @@ from ai_edge_litert import interpreter as tflite
 from groq import Groq
 from openai import OpenAI
 from piper import PiperVoice
-from silero_vad import load_silero_vad as _load_silero_vad_model
 
 from context import get_llm_context
 
@@ -473,13 +472,17 @@ vad_model = None
 def load_silero_vad() -> None:
     """Load the Silero VAD model at startup.
 
-    Uses the `silero-vad` pip package instead of torch.hub.load(), which
-    loads the model straight from local files bundled with the package —
-    no network round-trip / GitHub cache check, even on the first run.
+    Uses torch.hub.load() to fetch/cache the model, since the `silero-vad`
+    pip package (onnx-based) doesn't work reliably on Raspberry Pi.
     """
     global vad_model
     print(f"{ts()} Loading Silero VAD model...", flush=True)
-    model = _load_silero_vad_model(onnx=True)
+    model, _utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        onnx=False,
+    )
     model.eval()
     vad_model = model
     print(f"{ts()} Silero VAD model loaded.", flush=True)
