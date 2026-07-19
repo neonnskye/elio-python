@@ -30,7 +30,12 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
         )
 
 
+IGNORED_TOPICS = {"luna/robot/sensors"}
+
+
 def on_message(client, userdata, msg):
+    if msg.topic in IGNORED_TOPICS:
+        return
     payload = msg.payload.decode("utf-8", errors="replace").strip()
     print(f"[{ts()}] {msg.topic}  {payload}")
 
