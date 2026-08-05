@@ -1,5 +1,6 @@
 import platform
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -40,7 +41,7 @@ DETECT_WIDTH = 320
 
 # JPEG quality for the MJPEG stream (0-100). Lower = smaller frames = smoother
 # playback over the network, at the cost of some visual quality.
-MJPEG_QUALITY = 50
+MJPEG_QUALITY = 70
 
 # Width to downscale the annotated frame to before sending over the MJPEG
 # stream. Capture/detection/enrollment all stay at full CAM_WIDTH resolution —
@@ -105,6 +106,11 @@ class FacialRecognition:
         # produced the bounding box visible on screen — no second detect() call.
         self._latest_raw: tuple[np.ndarray, any] | None = None
         self._lock = threading.Lock()
+
+        # Raw-frame buffer for the capture → processing split.
+        # _capture_loop writes; _processing_loop reads.
+        self._current_frame: np.ndarray | None = None
+        self._frame_lock = threading.Lock()
 
         # --- Camera init: OpenCV on Windows, picamera2 on Linux (Pi) ---
         if self.HOST_OS == "Linux":
@@ -418,29 +424,51 @@ class FacialRecognition:
 
     def read_cam(self):
         if self.HOST_OS == "Linux":
-            self._read_cam_picamera2()
+            capture_target = self._capture_loop_picamera2
         else:
-            self._read_cam_opencv()
+            capture_target = self._capture_loop_opencv
 
-    def _read_cam_opencv(self):
-        """Capture loop using OpenCV VideoCapture (Windows / generic USB cam)."""
+        capture_thread = threading.Thread(target=capture_target, daemon=True)
+        capture_thread.start()
+
+        self._processing_loop()
+
+    def _capture_loop_opencv(self):
+        """Read from the webcam as fast as possible; never block on processing."""
         if not self._cap.isOpened():
             print("Error: Could not open webcam.")
             return
+
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         while True:
             ret, frame = self._cap.read()
             if not ret:
                 break
-            self._process_frame(frame)
+            with self._frame_lock:
+                self._current_frame = frame
 
-    def _read_cam_picamera2(self):
-        """Capture loop using picamera2 (Raspberry Pi camera module)."""
+    def _capture_loop_picamera2(self):
+        """Read from picamera2 as fast as possible."""
         while True:
             frame = self._picam.capture_array()
-            # capture_array() with RGB888 returns BGR-ordered data in practice —
-            # do NOT convert, just pass directly to OpenCV.
-            self._process_frame(frame)
+            with self._frame_lock:
+                self._current_frame = frame
+
+    def _processing_loop(self):
+        """Run detection/annotation on the most recent frame."""
+        while True:
+            with self._frame_lock:
+                frame = (
+                    self._current_frame.copy()
+                    if self._current_frame is not None
+                    else None
+                )
+
+            if frame is not None:
+                self._process_frame(frame)
+            else:
+                time.sleep(0.005)
 
     def generate_mjpeg(self):
         import time
@@ -509,4 +537,4 @@ def index():
 if __name__ == "__main__":
     cam_thread = threading.Thread(target=recognition.read_cam, daemon=True)
     cam_thread.start()
-    app.run(host="0.0.0.0", port=5000, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, use_reloader=False, threaded=True)
