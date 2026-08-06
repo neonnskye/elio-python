@@ -63,12 +63,12 @@ FACES_DB = Path("faces_db.npz")
 MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
-TOPIC_ROBOT_CMD = "luna/robot/cmd"  # payload: robot drive/mode commands
+TOPIC_ROBOT_STATUS = "luna/robot/status"  # payload: JSON with current controlMode
+TOPIC_ROBOT_FACE = "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"  # payload: OLED emotion name
 
-MODE_MANUAL = "MODE:2"
-CMD_FORWARD = "MANUAL:FORWARD"
-CMD_STOP = "MANUAL:STOP"
+CMD_FORWARD = "FORWARD"  # sent to luna/robot/face
+CMD_STOP = "STOP"
 
 EMOTION_KNOWN_FACE = "LOVE"
 EMOTION_DEFAULT = "HAPPY"
@@ -96,10 +96,9 @@ def _mqtt_publish(topic: str, payload: str) -> None:
 
 
 def _send_robot_drive_cmd(payload: str) -> None:
-    """Switch the robot into manual control mode, then send a drive command.
-    Mirrors receiver.py's pattern of sending MODE:2 before any MANUAL:* cmd."""
-    _mqtt_publish(TOPIC_ROBOT_CMD, MODE_MANUAL)
-    _mqtt_publish(TOPIC_ROBOT_CMD, payload)
+    """Send FORWARD/STOP directly to the face topic. The ESP32 only acts on
+    this topic when controlMode == 1 (FaceFollow)."""
+    _mqtt_publish(TOPIC_ROBOT_FACE, payload)
 
 
 # ---------------
@@ -180,7 +179,24 @@ class FacialRecognition:
         # result (so we send FORWARD/STOP exactly once on each transition).
         self._known_face_streak: int = 0
         self._robot_driving: bool = False
+        self._robot_control_mode: int = 2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        _mqtt_client.on_connect = self._on_mqtt_connect
+        _mqtt_client.on_message = self._on_mqtt_message
         self._load_db()
+
+    def _on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
+        if rc == 0:
+            client.subscribe(TOPIC_ROBOT_STATUS)
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        if msg.topic == TOPIC_ROBOT_STATUS:
+            try:
+                import json
+
+                payload = json.loads(msg.payload.decode())
+                self._robot_control_mode = payload.get("controlMode", 2)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Persistence
@@ -322,7 +338,23 @@ class FacialRecognition:
         """Called once per processed frame with whether a known face is
         currently visible anywhere in frame. Drives the robot forward after
         FORWARD_TRIGGER_FRAMES consecutive frames with a known face, and
-        stops it as soon as no known face is visible."""
+        stops it as soon as no known face is visible. Only acts when the
+        ESP32 is in FaceFollowMode (controlMode == 1)."""
+        # If we're not in FaceFollowMode, do NOT drive toward faces.
+        # If we were driving and the mode changed away from FaceFollow,
+        # send one STOP to halt the robot and reset state.
+        if self._robot_control_mode != 1:
+            if self._robot_driving:
+                self._robot_driving = False
+                self._known_face_streak = 0
+                _send_robot_drive_cmd(CMD_STOP)
+                _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_DEFAULT)
+                print(
+                    "[ROBOT] Mode changed away from FaceFollow — sending STOP",
+                    flush=True,
+                )
+            return
+
         if known_face_present:
             self._known_face_streak += 1
             if (
@@ -333,7 +365,7 @@ class FacialRecognition:
                 _send_robot_drive_cmd(CMD_FORWARD)
                 _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_KNOWN_FACE)
                 print(
-                    "[ROBOT] Known face confirmed — sending FORWARD + LOVE",
+                    "[ROBOT] Known face confirmed in FaceFollowMode — sending FORWARD + LOVE",
                     flush=True,
                 )
         else:
@@ -342,7 +374,9 @@ class FacialRecognition:
                 self._robot_driving = False
                 _send_robot_drive_cmd(CMD_STOP)
                 _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_DEFAULT)
-                print("[ROBOT] Known face lost — sending STOP + HAPPY", flush=True)
+                print(
+                    "[ROBOT] Known face lost — sending STOP + HAPPY", flush=True
+                )
 
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
         """Draw bounding boxes and identity labels on frame.
