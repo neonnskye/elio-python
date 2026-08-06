@@ -77,13 +77,23 @@ EMOTION_DEFAULT = "HAPPY"
 # trigger the forward-drive command (debounces flicker/misidentification).
 FORWARD_TRIGGER_FRAMES = 3
 
+import signal
+
 _mqtt_client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     client_id="elio-camera",
 )
 _mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
-_mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT)
-_mqtt_client.loop_start()
+
+
+def _handle_shutdown(signum, frame):
+    _send_robot_drive_cmd(CMD_STOP)
+    _mqtt_client.disconnect()
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGINT, _handle_shutdown)
+signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
 def _mqtt_publish(topic: str, payload: str) -> None:
@@ -182,6 +192,8 @@ class FacialRecognition:
         self._robot_control_mode: int = 2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
         _mqtt_client.on_connect = self._on_mqtt_connect
         _mqtt_client.on_message = self._on_mqtt_message
+        _mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT)
+        _mqtt_client.loop_start()
         self._load_db()
 
     def _on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
