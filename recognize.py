@@ -28,6 +28,14 @@ COSINE_THRESHOLD = 0.363  # below this → different person
 # Below this: reuse cached label (skip SFace CNN). Above: re-identify.
 MATCH_DIST_PX = 60
 
+# Number of consecutive processed frames a tracked face is allowed to reuse
+# its cached label before we force a fresh SFace re-identification. Without
+# this, a face that sits still keeps whatever label it got on its *first*
+# frame for the rest of the session — including a wrong, borderline match —
+# since the position-based cache alone never re-checks it. Periodic
+# re-verification lets a stationary face self-correct.
+REVERIFY_INTERVAL_FRAMES = 45
+
 # --- Performance tuning ---
 # Fixed capture resolution on both PC and Raspberry Pi.
 CAM_WIDTH = 640
@@ -154,10 +162,12 @@ class FacialRecognition:
 
         # known_faces: { "name_lower": { "display": str, "embeddings": list[np.ndarray] } }
         self._known_faces: dict[str, dict] = {}
-        # Per-face tracking cache for _annotate: (cx, cy, label) for each face
-        # seen in the previous frame, used to skip the expensive SFace forward
-        # pass when a face hasn't moved far enough to be a new person.
-        self._tracked_faces: list[tuple[float, float, str]] = []
+        # Per-face tracking cache for _annotate: (cx, cy, label, age) for each
+        # face seen in the previous frame, used to skip the expensive SFace
+        # forward pass when a face hasn't moved far enough to be a new
+        # person. `age` counts consecutive frames the cached label has been
+        # reused without re-verification (see REVERIFY_INTERVAL_FRAMES).
+        self._tracked_faces: list[tuple[float, float, str, int]] = []
         # Incremented on every enrollment so _annotate knows to bust the cache.
         self._db_version: int = 0
         self._tracked_faces_db_version: int = 0
@@ -339,7 +349,10 @@ class FacialRecognition:
 
         Reuses cached labels from the previous frame for faces whose bbox
         center hasn't moved more than MATCH_DIST_PX — only "new" faces
-        (by position) pay the full SFace feature() cost.
+        (by position) pay the full SFace feature() cost. A tracked face is
+        still periodically re-verified every REVERIFY_INTERVAL_FRAMES frames
+        even if it hasn't moved, so a stationary face isn't stuck with a
+        stale (or initially wrong) label for the rest of the session.
         """
         if faces is None:
             self._tracked_faces = []
@@ -362,7 +375,7 @@ class FacialRecognition:
 
             # Find the closest unclaimed face we tracked last frame
             best_i, best_d = -1, MATCH_DIST_PX
-            for i, (px, py, _label) in enumerate(self._tracked_faces):
+            for i, (px, py, _label, _age) in enumerate(self._tracked_faces):
                 if i in used:
                     continue
                 d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
@@ -371,15 +384,28 @@ class FacialRecognition:
                     best_i = i
 
             if best_i >= 0:
-                label = self._tracked_faces[best_i][2]
                 used.add(best_i)
+                _px, _py, cached_label, age = self._tracked_faces[best_i]
+                if age + 1 >= REVERIFY_INTERVAL_FRAMES:
+                    # Cached label has aged out — re-run SFace so a
+                    # lingering/stationary face periodically self-corrects
+                    # instead of keeping its first (possibly borderline)
+                    # identification for the rest of the session.
+                    aligned = self._recognizer.alignCrop(frame, face)
+                    emb = self._recognizer.feature(aligned)
+                    label = self._identify(emb)
+                    age = 0
+                else:
+                    label = cached_label
+                    age += 1
             else:
                 # New face — run the expensive recognition path
                 aligned = self._recognizer.alignCrop(frame, face)
                 emb = self._recognizer.feature(aligned)
                 label = self._identify(emb)
+                age = 0
 
-            new_tracked.append((cx, cy, label))
+            new_tracked.append((cx, cy, label, age))
 
             color = (0, 255, 0) if not label.startswith("Unknown") else (0, 0, 255)
 
