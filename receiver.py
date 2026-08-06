@@ -154,7 +154,7 @@ def extract_and_dispatch_cmd(text: str) -> str:
     """Scan *text* for a [CMD:PAYLOAD] tag emitted by the LLM.
 
     If found:
-    - Dispatches the command via MQTT (MODE-2 first for MANUAL commands).
+    - Dispatches the command via MQTT (MODE:2 first for MANUAL commands).
     - Returns the text with the tag stripped (so TTS never speaks it).
 
     If not found, returns text unchanged.
@@ -168,7 +168,7 @@ def extract_and_dispatch_cmd(text: str) -> str:
         if i == 0:
             # Only dispatch the first tag
             if payload.startswith("MANUAL:"):
-                mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+                mqtt_publish(TOPIC_ROBOT_CMD, "MODE:2")
                 time.sleep(0.05)
                 mqtt_publish(TOPIC_ROBOT_CMD, payload)
             else:
@@ -1455,7 +1455,7 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
                 voice_pipeline_idle = listen_state == ListenState.IDLE
             if voice_pipeline_idle:
                 mqtt_set_emotion("HAPPY")
-            mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+            mqtt_publish(TOPIC_ROBOT_CMD, "MODE:2")
             time.sleep(0.05)
             mqtt_publish(TOPIC_ROBOT_CMD, "MANUAL:STOP")
         return
@@ -1474,7 +1474,7 @@ def _process_music_results(results: list[tuple[str, float]]) -> None:
         print(
             f"{ts()} [music] Music detected. Starting dance {dance_idx}...", flush=True
         )
-        mqtt_publish(TOPIC_ROBOT_CMD, "MODE-2")
+        mqtt_publish(TOPIC_ROBOT_CMD, "MODE:2")
         time.sleep(0.05)
         mqtt_publish(TOPIC_ROBOT_CMD, f"DANCE:{dance_idx}")
 
@@ -1512,7 +1512,7 @@ def receive_loop(sock: socket.socket) -> None:
     while not shutdown_event.is_set():
         try:
             data, _ = sock.recvfrom(expected_bytes * 2)
-        except socket.timeout:
+        except TimeoutError:
             continue
         if len(data) != expected_bytes:
             continue
