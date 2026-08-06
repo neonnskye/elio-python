@@ -190,6 +190,10 @@ class FacialRecognition:
         self._known_face_streak: int = 0
         self._robot_driving: bool = False
         self._robot_control_mode: int = 2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        # True once the first FORWARD has been sent for the current FaceFollow
+        # session. Stops repeated FORWARD triggers while the robot drives up to
+        # the person. Reset when FaceFollow mode is (re)entered.
+        self._face_follow_completed: bool = False
         _mqtt_client.on_connect = self._on_mqtt_connect
         _mqtt_client.on_message = self._on_mqtt_message
         _mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT)
@@ -206,7 +210,12 @@ class FacialRecognition:
                 import json
 
                 payload = json.loads(msg.payload.decode())
-                self._robot_control_mode = payload.get("controlMode", 2)
+                new_mode = payload.get("controlMode", 2)
+                # (Re)entering FaceFollow mode after being in another mode:
+                # reset the completion flag so a new follow can start.
+                if new_mode == 1 and self._robot_control_mode != 1:
+                    self._face_follow_completed = False
+                self._robot_control_mode = new_mode
             except Exception:
                 pass
 
@@ -352,6 +361,12 @@ class FacialRecognition:
         FORWARD_TRIGGER_FRAMES consecutive frames with a known face, and
         stops it as soon as no known face is visible. Only acts when the
         ESP32 is in FaceFollowMode (controlMode == 1)."""
+        # Once the initial FORWARD has been sent for this FaceFollow session,
+        # stop sending further drive commands — the robot is already moving up
+        # to the person. Reset only when FaceFollow mode is re-entered.
+        if self._face_follow_completed:
+            return
+
         # If we're not in FaceFollowMode, do NOT drive toward faces.
         # If we were driving and the mode changed away from FaceFollow,
         # send one STOP to halt the robot and reset state.
@@ -374,6 +389,7 @@ class FacialRecognition:
                 and not self._robot_driving
             ):
                 self._robot_driving = True
+                self._face_follow_completed = True
                 _send_robot_drive_cmd(CMD_FORWARD)
                 _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_KNOWN_FACE)
                 print(
