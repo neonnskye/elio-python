@@ -22,6 +22,12 @@
         <button id="enroll-btn">Enroll</button>
         <span id="status-msg"></span>
       </div>
+      <div class="controls-row">
+        <button id="mute-btn" class="unmuted" aria-label="Mute speaker">
+          <span class="mute-icon">🔊</span>
+          <span class="mute-label">Mute Speaker</span>
+        </button>
+      </div>
     </div>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
