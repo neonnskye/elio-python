@@ -1,23 +1,32 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
+  <head>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
 
-<head>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-
-<body>
+  <body>
     <div class="container">
-        <div class="stream-window">
-            <img src="/stream" id="stream-img">
-        </div>
-        <div class="enroll-form">
-            <input type="text" id="name-input" placeholder="Name" autocomplete="off">
-            <button id="enroll-btn">Enroll</button>
-            <span id="status-msg"></span>
-        </div>
+      <div class="stream-window">
+        <img src="/stream" id="stream-img" />
+      </div>
+      <div class="stop-row">
+        <button id="stop-btn">⏹ Stop Speaking</button>
+      </div>
+      <div class="enroll-form">
+        <input
+          type="text"
+          id="name-input"
+          placeholder="Name"
+          autocomplete="off"
+        />
+        <button id="enroll-btn">Enroll</button>
+        <span id="status-msg"></span>
+      </div>
     </div>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
-</body>
-
+  </body>
 </html>

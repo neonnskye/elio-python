@@ -63,8 +63,13 @@ FACES_DB = Path("faces_db.npz")
 MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
+TOPIC_STOP = (
+    "elio/stop"  # payload: anything — receiver.py treats receipt as "stop narration"
+)
 TOPIC_ROBOT_STATUS = "luna/robot/status"  # payload: JSON with current controlMode
-TOPIC_ROBOT_FACE = "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
+TOPIC_ROBOT_FACE = (
+    "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
+)
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"  # payload: OLED emotion name
 
 CMD_FORWARD = "FORWARD"  # sent to luna/robot/face
@@ -189,7 +194,9 @@ class FacialRecognition:
         # result (so we send FORWARD/STOP exactly once on each transition).
         self._known_face_streak: int = 0
         self._robot_driving: bool = False
-        self._robot_control_mode: int = 2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        self._robot_control_mode: int = (
+            2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        )
         # True once the first FORWARD has been sent for the current FaceFollow
         # session. Stops repeated FORWARD triggers while the robot drives up to
         # the person. Reset when FaceFollow mode is (re)entered.
@@ -402,9 +409,7 @@ class FacialRecognition:
                 self._robot_driving = False
                 _send_robot_drive_cmd(CMD_STOP)
                 _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_DEFAULT)
-                print(
-                    "[ROBOT] Known face lost — sending STOP + HAPPY", flush=True
-                )
+                print("[ROBOT] Known face lost — sending STOP + HAPPY", flush=True)
 
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
         """Draw bounding boxes and identity labels on frame.
@@ -604,6 +609,19 @@ def stream():
         recognition.generate_mjpeg(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.route("/stop", methods=["POST"])
+def stop_narration():
+    """Interrupt whatever the robot is currently saying.
+
+    Published over MQTT rather than called in-process because receiver.py
+    (the audio pipeline) and recognize.py (this dashboard) are separate
+    processes — MQTT is the existing bridge between them (see TOPIC_FACE_SEEN).
+    receiver.py is subscribed to TOPIC_STOP and reacts to any payload.
+    """
+    _mqtt_publish(TOPIC_STOP, "1")
+    return jsonify({"ok": True})
 
 
 @app.route("/enroll", methods=["POST"])

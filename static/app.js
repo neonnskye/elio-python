@@ -39,3 +39,30 @@ btn.addEventListener("click", enroll);
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter") enroll();
 });
+
+const stopBtn = document.getElementById("stop-btn");
+const STOP_LABEL = "⏹ Stop Speaking";
+
+async function stopSpeaking() {
+  stopBtn.disabled = true;
+  stopBtn.textContent = "Stopping…";
+
+  try {
+    const res = await fetch("/stop", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      stopBtn.textContent = "✓ Stopped";
+    } else {
+      stopBtn.textContent = "Failed — retry";
+    }
+  } catch (err) {
+    stopBtn.textContent = "Failed — retry";
+  } finally {
+    setTimeout(() => {
+      stopBtn.disabled = false;
+      stopBtn.textContent = STOP_LABEL;
+    }, 900);
+  }
+}
+
+stopBtn.addEventListener("click", stopSpeaking);

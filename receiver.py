@@ -257,6 +257,7 @@ TOPIC_TRANSCRIPT_USER = "elio/transcript/user"
 TOPIC_TRANSCRIPT_ASST = "elio/transcript/assistant"
 TOPIC_SYSTEM_READY = "elio/system/ready"
 TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
+TOPIC_STOP = "elio/stop"  # published by the web dashboard's stop/mute button
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: display name of the recognised person
@@ -389,6 +390,15 @@ leftover: np.ndarray = np.zeros(0, dtype=np.float32)
 response_queue: collections.deque = collections.deque()
 is_responding: bool = False
 
+# --- Narration interrupt ("stop" button) ---
+# Every LLM turn is tagged with the value of `epoch` at the moment it starts.
+# Pressing stop bumps `epoch`. Every stage of the streaming LLM -> TTS ->
+# playback pipeline carries its tag along and compares it against the live
+# value before doing any further work, so a stale turn's audio is dropped
+# (not played) the instant it's checked, instead of running to completion.
+epoch: int = 0
+epoch_lock = threading.Lock()
+
 # TTS queue for LLM responses to be spoken aloud (text sentences)
 tts_queue: queue.Queue = queue.Queue()
 
@@ -438,6 +448,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
         print(f"{ts()} [MQTT] Connected to broker.", flush=True)
         client.subscribe(TOPIC_WAKE)
         client.subscribe(TOPIC_FACE_SEEN)
+        client.subscribe(TOPIC_STOP)
         if _system_ready:
             # Re-publish so an ESP32 that restarted while we were up gets the signal
             client.publish(TOPIC_SYSTEM_READY, "1", retain=True)
@@ -519,6 +530,11 @@ def on_mqtt_message(client, userdata, msg) -> None:
         except Exception:
             return
         handle_face_seen(name)
+        return
+
+    if msg.topic == TOPIC_STOP:
+        print(f"\n{ts()} [STOP] Stop request received via MQTT.", flush=True)
+        stop_narration("user pressed stop")
         return
 
     if msg.topic != TOPIC_WAKE:
@@ -804,6 +820,13 @@ def llm_loop() -> None:
             break
         tts_queued = False
         timed_out = False
+        interrupted = False
+
+        # Snapshot the epoch this turn belongs to. If stop_narration() bumps
+        # `epoch` while we're mid-stream, the check inside the token loop
+        # below will notice the mismatch and abort — see stop_narration().
+        with epoch_lock:
+            my_epoch = epoch
 
         # Augment story requests with a randomly selected story before sending to
         # the LLM.  We store only the original transcript in history so the
@@ -863,6 +886,17 @@ def llm_loop() -> None:
                     timed_out = True
                     break
 
+                # Check: stop button pressed mid-stream
+                with epoch_lock:
+                    if epoch != my_epoch:
+                        print(
+                            f"\n{ts()} [LLM] Interrupted by stop request — "
+                            "aborting stream",
+                            flush=True,
+                        )
+                        interrupted = True
+                        break
+
                 token = chunk.choices[0].delta.content or ""
                 if token:
                     collected += token
@@ -876,7 +910,7 @@ def llm_loop() -> None:
                         clean = strip_markdown(sentence).strip()
                         clean = extract_and_dispatch_cmd(clean)
                         if clean:
-                            tts_queue.put(clean)
+                            tts_queue.put((my_epoch, clean))
                             tts_queued = True
 
             if timed_out:
@@ -890,18 +924,30 @@ def llm_loop() -> None:
                 reset_to_idle("LLM timeout")
                 continue
 
+            if interrupted:
+                # Stop was already handled (queues flushed, state reset) by
+                # stop_narration() itself — just clean up the dangling user
+                # turn so history doesn't contain a question with no answer.
+                with history_lock:
+                    if (
+                        conversation_history
+                        and conversation_history[-1]["role"] == "user"
+                    ):
+                        conversation_history.pop()
+                continue
+
             # Flush any remaining text in the buffer as a final sentence
             if buffer.strip():
                 clean = strip_markdown(buffer).strip()
                 clean = extract_and_dispatch_cmd(clean)
                 if clean:
-                    tts_queue.put(clean)
+                    tts_queue.put((my_epoch, clean))
                     tts_queued = True
 
             # Signal end of this LLM turn to the TTS pipeline so reset_to_idle
             # fires exactly once, not once per sentence.
             if tts_queued:
-                tts_queue.put(TTS_TURN_DONE)
+                tts_queue.put((my_epoch, TTS_TURN_DONE))
 
             # Log the full response for debugging
             sanitized = strip_markdown(collected)
@@ -953,14 +999,22 @@ def wav_bytes_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
     return pcm / 32768.0, sample_rate
 
 
-def send_audio_esp32(pcm_int16: np.ndarray) -> None:
+def send_audio_esp32(pcm_int16: np.ndarray, item_epoch: int) -> None:
     """Send int16 PCM audio to the ESP32 over UDP, paced to real-time.
     Uses deadline-based timing instead of sleep() to avoid drift.
+
+    Checked once per ~32ms chunk against the live epoch (see
+    stop_narration()) so a stop request cuts the UDP stream off mid-sentence
+    instead of finishing whatever's already synthesized.
     """
     chunk_duration = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s
     deadline = time.monotonic()
 
     for i in range(0, len(pcm_int16), AUDIO_SEND_CHUNK):
+        with epoch_lock:
+            if epoch != item_epoch:
+                return  # stop was pressed mid-sentence — abort the rest of this send
+
         chunk = pcm_int16[i : i + AUDIO_SEND_CHUNK]
         if len(chunk) < AUDIO_SEND_CHUNK:
             chunk = np.pad(chunk, (0, AUDIO_SEND_CHUNK - len(chunk)))
@@ -1067,13 +1121,62 @@ def reset_to_idle(reason: str = "") -> None:
         print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
-def play_audio_local(pcm_int16: np.ndarray) -> None:
+def stop_narration(reason: str = "") -> None:
+    """Hard-interrupt whatever the robot is currently saying.
+
+    This can't reach into the ESP32 firmware (no playback-flush opcode
+    exists there), so it works entirely by cutting the pipeline off at the
+    source on the Pi side:
+      1. Bump `epoch` so every in-flight or queued item (LLM tokens still
+         streaming, sentences waiting on TTS, synthesized audio waiting to
+         play, and the packet-by-packet UDP sender) sees a stale tag and
+         drops itself instead of continuing.
+      2. Drain every queue so nothing stale lingers around consuming memory
+         or confusing print output.
+      3. Reset state machine + LEDs/chime via reset_to_idle().
+
+    Residual latency: the ESP32's onboard jitter buffer (~96ms) plus
+    whatever's already sitting in the I2S DMA buffer will still play out —
+    that's a hardware floor we can't clear without touching firmware. In
+    practice this means playback stops within roughly one audio packet
+    (~32ms) of the button being pressed, not truly instantaneously.
+    """
+    global epoch
+
+    with epoch_lock:
+        epoch += 1
+
+    # Drain queues best-effort — anything still arriving after this point
+    # will already be tagged stale and get dropped by the consumers anyway,
+    # this just avoids leaving dead items sitting around.
+    try:
+        while True:
+            tts_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    with audio_queue_lock:
+        audio_queue.clear()
+
+    try:
+        while True:
+            audio_ready_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    reset_to_idle(reason)
+
+
+def play_audio_local(pcm_int16: np.ndarray, item_epoch: int) -> None:
     """Queue int16 PCM audio for local playback via sounddevice.
     PCM data is expected to be at 16kHz (resampled upstream in tts_loop).
     """
     global is_responding
     pcm_float = pcm_int16.astype(np.float32) / 32768.0
     with queue_lock:
+        with epoch_lock:
+            if epoch != item_epoch:
+                return  # stale turn — stop was pressed, don't queue this audio
         is_responding = True
         for i in range(0, len(pcm_float), SAMPLES_PER_PKT):
             chunk = pcm_float[i : i + SAMPLES_PER_PKT]
@@ -1082,16 +1185,20 @@ def play_audio_local(pcm_int16: np.ndarray) -> None:
             response_queue.append(chunk)
 
 
-def play_audio(pcm_int16: np.ndarray) -> None:
-    """Route int16 PCM audio to the configured output(s)."""
+def play_audio(pcm_int16: np.ndarray, item_epoch: int) -> None:
+    """Route int16 PCM audio to the configured output(s).
+
+    `item_epoch` is the epoch this audio was generated under — see
+    stop_narration() for how this is used to abort mid-stream.
+    """
     if AUDIO_OUTPUT == "local":
-        play_audio_local(pcm_int16)
+        play_audio_local(pcm_int16, item_epoch)
     elif AUDIO_OUTPUT == "esp32":
-        send_audio_esp32(pcm_int16)
+        send_audio_esp32(pcm_int16, item_epoch)
     elif AUDIO_OUTPUT == "both":
         # Local playback is non-blocking (just queues), so run it first
-        play_audio_local(pcm_int16)
-        send_audio_esp32(pcm_int16)
+        play_audio_local(pcm_int16, item_epoch)
+        send_audio_esp32(pcm_int16, item_epoch)
 
 
 # =============================================================================
@@ -1144,8 +1251,10 @@ def handle_face_seen(name: str) -> None:
     def _greet() -> None:
         try:
             pcm_int16 = synthesize_text(greeting)
+            with epoch_lock:
+                greet_epoch = epoch
             mqtt_set_emotion("LOVE")
-            play_audio(pcm_int16)
+            play_audio(pcm_int16, greet_epoch)
         except Exception as exc:
             print(
                 f"{ts()} [FACE] Greeting synthesis/playback failed: {exc}", flush=True
@@ -1266,34 +1375,42 @@ def tts_dispatcher_loop() -> None:
 
     while not shutdown_event.is_set():
         try:
-            text = tts_queue.get(timeout=1.0)
+            item = tts_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
-        if text is None:
-            break
+        if item is None:
+            break  # shutdown sentinel
+
+        item_epoch, text = item
+
+        # Drop anything left over from a turn that stop_narration() already
+        # invalidated — don't even bother submitting it for synthesis.
+        with epoch_lock:
+            if item_epoch != epoch:
+                continue
 
         if text is TTS_TURN_DONE:
             with tts_seq_lock:
                 seq = tts_sequence
                 tts_sequence += 1
-            audio_ready_queue.put((seq, None))
+            audio_ready_queue.put((seq, item_epoch, None))
             continue
 
         with tts_seq_lock:
             seq = tts_sequence
             tts_sequence += 1
 
-        def _on_done(fut: concurrent.futures.Future, s: int):
+        def _on_done(fut: concurrent.futures.Future, s: int, e: int):
             try:
                 audio = fut.result()
-                audio_ready_queue.put((s, audio))
+                audio_ready_queue.put((s, e, audio))
             except Exception as exc:
-                audio_ready_queue.put((s, exc))
+                audio_ready_queue.put((s, e, exc))
 
         print(f"{ts()} [TTS] Queuing seq={seq} ({len(text)} chars)...", flush=True)
         future = tts_executor.submit(synthesize_text, text)
-        future.add_done_callback(lambda f, s=seq: _on_done(f, s))
+        future.add_done_callback(lambda f, s=seq, e=item_epoch: _on_done(f, s, e))
 
     # Graceful executor shutdown on exit
     if tts_executor is not None:
@@ -1308,42 +1425,51 @@ def audio_collector_loop() -> None:
     the playback thread when the next expected sequence number arrives.
     """
     next_seq = 0
-    buffer: dict[int, np.ndarray | Exception | None] = {}
+    buffer: dict[int, tuple[int, np.ndarray | Exception | None]] = {}
 
     while not shutdown_event.is_set():
         try:
-            seq, item = audio_ready_queue.get(timeout=0.1)
+            seq, item_epoch, item = audio_ready_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
         if seq != next_seq:
-            buffer[seq] = item
+            buffer[seq] = (item_epoch, item)
             continue
 
         # Walk the sequential chain starting at next_seq
         while True:
-            if item is None:
+            with epoch_lock:
+                stale = item_epoch != epoch
+
+            if stale:
+                # This turn was interrupted by stop_narration() after this
+                # result was already submitted for synthesis — drop it
+                # silently, but still advance next_seq so the reordering
+                # buffer doesn't stall waiting for a sequence number that
+                # will never arrive "fresh".
+                pass
+            elif item is None:
                 # End-of-turn sentinel → tell playback to call reset_to_idle
                 with audio_queue_lock:
-                    audio_queue.append(None)
+                    audio_queue.append((item_epoch, None))
                 audio_queue_event.set()
-                next_seq += 1
             elif isinstance(item, Exception):
                 print(f"{ts()} [TTS error] seq={next_seq}: {item}", flush=True)
                 reset_to_idle("TTS synthesis error")
-                next_seq += 1
             else:
                 with audio_queue_lock:
-                    audio_queue.append(item)
+                    audio_queue.append((item_epoch, item))
                 audio_queue_event.set()
                 print(
                     f"{ts()} [TTS] seq={next_seq} → queued {len(item)} samples ({AUDIO_OUTPUT})",
                     flush=True,
                 )
-                next_seq += 1
+
+            next_seq += 1
 
             if next_seq in buffer:
-                item = buffer.pop(next_seq)
+                item_epoch, item = buffer.pop(next_seq)
             else:
                 break
 
@@ -1360,7 +1486,17 @@ def audio_dispatch_loop() -> None:
             with audio_queue_lock:
                 if not audio_queue:
                     break
-                item = audio_queue.popleft()
+                item_epoch, item = audio_queue.popleft()
+
+            with epoch_lock:
+                stale = item_epoch != epoch
+            if stale:
+                # Interrupted by stop_narration() — this sentence (or the
+                # end-of-turn sentinel) belongs to a turn that no longer
+                # exists, so drop it without playing or resetting anything
+                # (stop_narration() already did the reset).
+                continue
+
             if item is None:
                 # End-of-turn sentinel — reset state once, not once per sentence
                 time.sleep(
@@ -1370,7 +1506,7 @@ def audio_dispatch_loop() -> None:
             else:
                 mqtt_publish(TOPIC_STATE, "speaking")
                 mqtt_set_emotion("HAPPY")
-                play_audio(item)
+                play_audio(item, item_epoch)
         audio_queue_event.clear()
 
 
