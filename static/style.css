@@ -48,67 +48,31 @@ body {
   max-width: 480px;
 }
 
-#stop-btn {
-  padding: 10px 22px;
-  background: #e5484d;
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-#stop-btn:hover:not(:disabled) {
-  background: #c8383d;
-}
-
-#stop-btn:active:not(:disabled) {
-  background: #ad2e33;
-}
-
-#stop-btn:disabled {
-  background: #9da4b0;
-  cursor: default;
-}
-
+#stop-btn,
 #listen-toggle-btn {
-  padding: 10px 22px;
-  background: #4f6ef7;
-  color: #fff;
+  padding: 8px 0;
+  background: transparent;
+  color: inherit;
   border: none;
-  border-radius: 6px;
-  font-size: 14px;
+  border-radius: 0;
+  box-shadow: none;
+  font-size: 15px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.15s;
 }
 
-#listen-toggle-btn:hover:not(:disabled) {
-  background: #3a56d4;
-}
-
-#listen-toggle-btn:active:not(:disabled) {
-  background: #2e45b8;
-}
-
+#stop-btn:disabled,
 #listen-toggle-btn:disabled {
   cursor: default;
-  opacity: 0.7;
+  opacity: 0.6;
 }
 
-/* Toggled ON = the robot is currently ignoring wake-word commands */
+/* State shown via capitalization: all caps = the robot is not speaking /
+   not listening. Title case = currently speaking / listening. */
+
+#stop-btn.stopped,
 #listen-toggle-btn.muted {
-  background: #e5484d;
-}
-
-#listen-toggle-btn.muted:hover:not(:disabled) {
-  background: #c8383d;
-}
-
-#listen-toggle-btn.muted:active:not(:disabled) {
-  background: #ad2e33;
+  text-transform: uppercase;
 }
 
 .enroll-form {

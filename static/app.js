@@ -41,26 +41,16 @@ input.addEventListener("keydown", (e) => {
 });
 
 const stopBtn = document.getElementById("stop-btn");
-const STOP_LABEL = "⏹ Stop Speaking";
 
 async function stopSpeaking() {
   stopBtn.disabled = true;
-  stopBtn.textContent = "Stopping…";
+  stopBtn.classList.add("stopped");
 
   try {
-    const res = await fetch("/stop", { method: "POST" });
-    const data = await res.json();
-    if (data.ok) {
-      stopBtn.textContent = "✓ Stopped";
-    } else {
-      stopBtn.textContent = "Failed — retry";
-    }
-  } catch (err) {
-    stopBtn.textContent = "Failed — retry";
+    await fetch("/stop", { method: "POST" });
   } finally {
     setTimeout(() => {
       stopBtn.disabled = false;
-      stopBtn.textContent = STOP_LABEL;
     }, 900);
   }
 }
@@ -68,8 +58,8 @@ async function stopSpeaking() {
 stopBtn.addEventListener("click", stopSpeaking);
 
 const listenToggleBtn = document.getElementById("listen-toggle-btn");
-const LISTEN_LABEL_ON = "🎤 Stop Listening"; // currently listening; click to mute
-const LISTEN_LABEL_MUTED = "🔇 Start Listening"; // currently muted; click to resume
+const LISTEN_LABEL_ON = "Elio"; // currently listening; click to mute
+const LISTEN_LABEL_MUTED = "Elio"; // currently muted; click to resume
 
 async function toggleListening() {
   listenToggleBtn.disabled = true;
@@ -79,11 +69,7 @@ async function toggleListening() {
     const data = await res.json();
     if (data.ok) {
       applyListenState(data.muted);
-    } else {
-      listenToggleBtn.textContent = "Failed — retry";
     }
-  } catch (err) {
-    listenToggleBtn.textContent = "Failed — retry";
   } finally {
     listenToggleBtn.disabled = false;
   }
