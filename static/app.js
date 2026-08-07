@@ -52,6 +52,9 @@ async function stopSpeaking() {
     setTimeout(() => {
       stopBtn.disabled = false;
     }, 900);
+    setTimeout(() => {
+      stopBtn.classList.remove("stopped");
+    }, 2500);
   }
 }
 
