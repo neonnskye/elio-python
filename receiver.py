@@ -260,6 +260,7 @@ TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: display name of the recognised person
+TOPIC_AUDIO_MUTE = "elio/audio/mute"  # payload: "1" = muted, "0" = unmuted
 
 BLEED_SKIP_PACKETS = (
     16  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
@@ -410,6 +411,31 @@ history_lock = threading.Lock()
 # UDP socket for sending TTS audio to ESP32
 audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# ---- Mute control ----
+# When True, all three TTS pipeline stages (LLM tokenisation, synthesis,
+# playback) are silenced. Toggled via MQTT topic elio/audio/mute.
+_mute_audio: bool = False
+_mute_lock = threading.Lock()
+
+
+def _set_mute(muted: bool) -> None:
+    """Set the global mute flag and, if muting, drain the audio queues so
+    in-flight audio stops as quickly as possible."""
+    global _mute_audio
+    with _mute_lock:
+        _mute_audio = muted
+    if muted:
+        # Flush the pending-audio queue so the dispatch loop has nothing to play
+        with audio_queue_lock:
+            audio_queue.clear()
+        audio_queue_event.set()  # wake the dispatch loop so it exits cleanly
+        print(f"{ts()} [MUTE] Speaker muted — audio queues flushed.", flush=True)
+    else:
+        print(f"{ts()} [MUTE] Speaker unmuted.", flush=True)
+
+
+# ----------------------
+
 mqtt_client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="elio-receiver"
 )
@@ -438,6 +464,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
         print(f"{ts()} [MQTT] Connected to broker.", flush=True)
         client.subscribe(TOPIC_WAKE)
         client.subscribe(TOPIC_FACE_SEEN)
+        client.subscribe(TOPIC_AUDIO_MUTE)
         if _system_ready:
             # Re-publish so an ESP32 that restarted while we were up gets the signal
             client.publish(TOPIC_SYSTEM_READY, "1", retain=True)
@@ -507,9 +534,18 @@ _WAKE_COOLDOWN_S: float = 1.5
 
 def on_mqtt_message(client, userdata, msg) -> None:
     """MQTT callback — fires when a message arrives on any subscribed topic.
-    Replaces control_listener(). Handles elio/wake and elio/face/seen.
+    Replaces control_listener(). Handles elio/wake, elio/face/seen, and
+    elio/audio/mute.
     """
     global listen_state, bleed_remaining, _last_wake_time
+
+    if msg.topic == TOPIC_AUDIO_MUTE:
+        try:
+            val = msg.payload.decode("utf-8").strip()
+        except Exception:
+            return
+        _set_mute(val == "1")
+        return
 
     if msg.topic == TOPIC_FACE_SEEN:
         if RECORDING_MODE:
@@ -876,8 +912,17 @@ def llm_loop() -> None:
                         clean = strip_markdown(sentence).strip()
                         clean = extract_and_dispatch_cmd(clean)
                         if clean:
-                            tts_queue.put(clean)
-                            tts_queued = True
+                            # Gate 1: skip TTS if speaker is muted
+                            with _mute_lock:
+                                _muted_now = _mute_audio
+                            if _muted_now:
+                                print(
+                                    f"{ts()} [MUTE] LLM token dropped (muted): {clean!r}",
+                                    flush=True,
+                                )
+                            else:
+                                tts_queue.put(clean)
+                                tts_queued = True
 
             if timed_out:
                 # Stream timed out — don't commit assistant reply; remove user turn
@@ -895,8 +940,12 @@ def llm_loop() -> None:
                 clean = strip_markdown(buffer).strip()
                 clean = extract_and_dispatch_cmd(clean)
                 if clean:
-                    tts_queue.put(clean)
-                    tts_queued = True
+                    # Gate 1 (tail flush): skip TTS if speaker is muted
+                    with _mute_lock:
+                        _muted_now = _mute_audio
+                    if not _muted_now:
+                        tts_queue.put(clean)
+                        tts_queued = True
 
             # Signal end of this LLM turn to the TTS pipeline so reset_to_idle
             # fires exactly once, not once per sentence.
@@ -956,11 +1005,21 @@ def wav_bytes_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
 def send_audio_esp32(pcm_int16: np.ndarray) -> None:
     """Send int16 PCM audio to the ESP32 over UDP, paced to real-time.
     Uses deadline-based timing instead of sleep() to avoid drift.
+    Checks the mute flag on every chunk so mid-stream mute takes effect
+    within one packet period (~32ms).
     """
     chunk_duration = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s
     deadline = time.monotonic()
 
     for i in range(0, len(pcm_int16), AUDIO_SEND_CHUNK):
+        # Gate 3b: abort mid-stream if muted
+        with _mute_lock:
+            if _mute_audio:
+                print(
+                    f"{ts()} [MUTE] UDP send aborted mid-stream at sample {i}",
+                    flush=True,
+                )
+                return
         chunk = pcm_int16[i : i + AUDIO_SEND_CHUNK]
         if len(chunk) < AUDIO_SEND_CHUNK:
             chunk = np.pad(chunk, (0, AUDIO_SEND_CHUNK - len(chunk)))
@@ -1280,6 +1339,16 @@ def tts_dispatcher_loop() -> None:
             audio_ready_queue.put((seq, None))
             continue
 
+        # Gate 2: skip synthesis entirely if speaker is muted
+        with _mute_lock:
+            _muted_now = _mute_audio
+        if _muted_now:
+            print(
+                f"{ts()} [MUTE] TTS synthesis skipped (muted): {text!r}",
+                flush=True,
+            )
+            continue
+
         with tts_seq_lock:
             seq = tts_sequence
             tts_sequence += 1
@@ -1368,6 +1437,15 @@ def audio_dispatch_loop() -> None:
                 )  # drain delay: let ESP32 I2S DMA finish playing last packet
                 reset_to_idle("ESP32 playback finished")
             else:
+                # Gate 3: drop audio if speaker is muted
+                with _mute_lock:
+                    _muted_now = _mute_audio
+                if _muted_now:
+                    print(
+                        f"{ts()} [MUTE] Audio playback dropped (muted): {len(item)} samples",
+                        flush=True,
+                    )
+                    continue
                 mqtt_publish(TOPIC_STATE, "speaking")
                 mqtt_set_emotion("HAPPY")
                 play_audio(item)

@@ -91,3 +91,92 @@ body {
 #enroll-btn:active {
   background: #2e45b8;
 }
+
+/* ---- Controls row (mute button) ---- */
+
+.controls-row {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  max-width: 480px;
+}
+
+#mute-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.2s,
+    transform 0.1s,
+    box-shadow 0.2s;
+  letter-spacing: 0.01em;
+}
+
+#mute-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Unmuted state — matches enroll button palette */
+#mute-btn.unmuted {
+  background: #4f6ef7;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(79, 110, 247, 0.25);
+}
+
+#mute-btn.unmuted:hover {
+  background: #3a56d4;
+  box-shadow: 0 4px 14px rgba(79, 110, 247, 0.35);
+}
+
+#mute-btn.unmuted:active {
+  background: #2e45b8;
+  transform: scale(0.97);
+}
+
+/* Muted state — warm red / coral */
+#mute-btn.muted {
+  background: #e05252;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(224, 82, 82, 0.3);
+  animation: muted-pulse 2s ease-in-out infinite;
+}
+
+#mute-btn.muted:hover {
+  background: #c43b3b;
+  box-shadow: 0 4px 14px rgba(224, 82, 82, 0.4);
+  animation: none;
+}
+
+#mute-btn.muted:active {
+  background: #a82e2e;
+  transform: scale(0.97);
+  animation: none;
+}
+
+.mute-icon {
+  font-size: 16px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.mute-label {
+  pointer-events: none;
+}
+
+/* Subtle pulse when muted to draw attention without being distracting */
+@keyframes muted-pulse {
+  0%,
+  100% {
+    box-shadow: 0 2px 8px rgba(224, 82, 82, 0.3);
+  }
+  50% {
+    box-shadow: 0 2px 18px rgba(224, 82, 82, 0.55);
+  }
+}

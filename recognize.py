@@ -64,8 +64,11 @@ MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognised person
 TOPIC_ROBOT_STATUS = "luna/robot/status"  # payload: JSON with current controlMode
-TOPIC_ROBOT_FACE = "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
+TOPIC_ROBOT_FACE = (
+    "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
+)
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"  # payload: OLED emotion name
+TOPIC_AUDIO_MUTE = "elio/audio/mute"  # payload: "1" = muted, "0" = unmuted
 
 CMD_FORWARD = "FORWARD"  # sent to luna/robot/face
 CMD_STOP = "STOP"
@@ -189,7 +192,9 @@ class FacialRecognition:
         # result (so we send FORWARD/STOP exactly once on each transition).
         self._known_face_streak: int = 0
         self._robot_driving: bool = False
-        self._robot_control_mode: int = 2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        self._robot_control_mode: int = (
+            2  # 1=FaceFollow, 2=Manual, 3=Dance (default safe)
+        )
         # True once the first FORWARD has been sent for the current FaceFollow
         # session. Stops repeated FORWARD triggers while the robot drives up to
         # the person. Reset when FaceFollow mode is (re)entered.
@@ -402,9 +407,7 @@ class FacialRecognition:
                 self._robot_driving = False
                 _send_robot_drive_cmd(CMD_STOP)
                 _mqtt_publish(TOPIC_ROBOT_EMOTION, EMOTION_DEFAULT)
-                print(
-                    "[ROBOT] Known face lost — sending STOP + HAPPY", flush=True
-                )
+                print("[ROBOT] Known face lost — sending STOP + HAPPY", flush=True)
 
     def _annotate(self, frame: np.ndarray, faces) -> np.ndarray:
         """Draw bounding boxes and identity labels on frame.
@@ -615,6 +618,48 @@ def enroll():
     ok, message = recognition.enroll_from_frame(name)
     status = 200 if ok else 422
     return jsonify({"ok": ok, "message": message}), status
+
+
+# ---- Mute control ----
+# Tracks current mute state so /mute-status can reflect it on page load.
+_mute_state: bool = False
+
+
+@app.route("/mute", methods=["POST"])
+def mute_toggle():
+    """Toggle speaker mute. Accepts JSON {"muted": true|false} and
+    publishes the new state to MQTT so receiver.py acts on it immediately.
+    """
+    global _mute_state
+    data = request.get_json(silent=True) or {}
+    if "muted" not in data:
+        return jsonify({"ok": False, "message": "Missing 'muted' field."}), 400
+
+    _mute_state = bool(data["muted"])
+    payload = "1" if _mute_state else "0"
+
+    if _mqtt_client.is_connected():
+        _mqtt_client.publish(TOPIC_AUDIO_MUTE, payload)
+    else:
+        print(
+            f"[MUTE] MQTT not connected — could not publish mute={payload}",
+            flush=True,
+        )
+
+    print(
+        f"[MUTE] Speaker {'muted' if _mute_state else 'unmuted'} via dashboard.",
+        flush=True,
+    )
+    return jsonify({"ok": True, "muted": _mute_state})
+
+
+@app.route("/mute-status", methods=["GET"])
+def mute_status():
+    """Return the current mute state so the UI can initialize the button correctly."""
+    return jsonify({"muted": _mute_state})
+
+
+# ----------------------
 
 
 @app.route("/")
