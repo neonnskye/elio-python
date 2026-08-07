@@ -66,6 +66,9 @@ TOPIC_FACE_SEEN = "elio/face/seen"  # payload: the display name of the recognise
 TOPIC_STOP = (
     "elio/stop"  # payload: anything — receiver.py treats receipt as "stop narration"
 )
+TOPIC_LISTEN_MUTE = (
+    "elio/listen_mute"  # payload: "1" = ignore wake word, "0" = resume listening
+)
 TOPIC_ROBOT_STATUS = "luna/robot/status"  # payload: JSON with current controlMode
 TOPIC_ROBOT_FACE = (
     "luna/robot/face"  # payload: FORWARD/STOP (acted on only in FaceFollowMode)
@@ -90,6 +93,13 @@ _mqtt_client = mqtt.Client(
 )
 _mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
 
+# Server-side source of truth for the "stop listening" toggle. recognize.py
+# owns this state (not receiver.py) so the dashboard can query/flip it even
+# if receiver.py is momentarily disconnected from MQTT — the retained
+# publish below still lets receiver.py (and any ESP32) pick up the current
+# value on (re)connect.
+_listen_muted = False
+
 
 def _handle_shutdown(signum, frame):
     _send_robot_drive_cmd(CMD_STOP)
@@ -101,11 +111,11 @@ signal.signal(signal.SIGINT, _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
-def _mqtt_publish(topic: str, payload: str) -> None:
+def _mqtt_publish(topic: str, payload: str, retain: bool = False) -> None:
     if not _mqtt_client.is_connected():
         return
     try:
-        _mqtt_client.publish(topic, payload)
+        _mqtt_client.publish(topic, payload, retain=retain)
     except Exception as exc:
         print(f"[MQTT] Publish failed ({topic!r} {payload!r}): {exc}", flush=True)
 
@@ -622,6 +632,24 @@ def stop_narration():
     """
     _mqtt_publish(TOPIC_STOP, "1")
     return jsonify({"ok": True})
+
+
+@app.route("/toggle-listen", methods=["POST"])
+def toggle_listen():
+    """Flip the "stop listening" toggle and broadcast the new state.
+
+    Mirrors /stop's use of MQTT as the bridge to receiver.py, but unlike
+    /stop this is a persistent on/off state rather than a one-shot event, so
+    it's published retained — receiver.py (or an ESP32 that reconnects
+    later) picks up the current value immediately instead of waiting for
+    the next toggle.  receiver.py reacts by ignoring wake-word ("Elio")
+    triggers entirely while muted; it does not affect narration/TTS, which
+    is handled separately by /stop.
+    """
+    global _listen_muted
+    _listen_muted = not _listen_muted
+    _mqtt_publish(TOPIC_LISTEN_MUTE, "1" if _listen_muted else "0", retain=True)
+    return jsonify({"ok": True, "muted": _listen_muted})
 
 
 @app.route("/enroll", methods=["POST"])

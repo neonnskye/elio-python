@@ -66,3 +66,32 @@ async function stopSpeaking() {
 }
 
 stopBtn.addEventListener("click", stopSpeaking);
+
+const listenToggleBtn = document.getElementById("listen-toggle-btn");
+const LISTEN_LABEL_ON = "🎤 Stop Listening"; // currently listening; click to mute
+const LISTEN_LABEL_MUTED = "🔇 Start Listening"; // currently muted; click to resume
+
+async function toggleListening() {
+  listenToggleBtn.disabled = true;
+
+  try {
+    const res = await fetch("/toggle-listen", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      applyListenState(data.muted);
+    } else {
+      listenToggleBtn.textContent = "Failed — retry";
+    }
+  } catch (err) {
+    listenToggleBtn.textContent = "Failed — retry";
+  } finally {
+    listenToggleBtn.disabled = false;
+  }
+}
+
+function applyListenState(muted) {
+  listenToggleBtn.classList.toggle("muted", muted);
+  listenToggleBtn.textContent = muted ? LISTEN_LABEL_MUTED : LISTEN_LABEL_ON;
+}
+
+listenToggleBtn.addEventListener("click", toggleListening);

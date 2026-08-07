@@ -257,7 +257,13 @@ TOPIC_TRANSCRIPT_USER = "elio/transcript/user"
 TOPIC_TRANSCRIPT_ASST = "elio/transcript/assistant"
 TOPIC_SYSTEM_READY = "elio/system/ready"
 TOPIC_SYSTEM_SHUTDOWN = "elio/system/shutdown"
-TOPIC_STOP = "elio/stop"  # published by the web dashboard's stop/mute button
+TOPIC_STOP = "elio/stop"  # published by the web dashboard's stop-speaking button
+TOPIC_LISTEN_MUTE = (
+    "elio/listen_mute"  # published by the web dashboard's stop-listening toggle
+    # payload: "1" = ignore wake word ("Elio") triggers, "0" = resume listening.
+    # Published retained by recognize.py, so we pick up the current state on
+    # (re)connect even if we were offline when the toggle was last flipped.
+)
 TOPIC_ROBOT_CMD = "luna/robot/cmd"
 TOPIC_ROBOT_EMOTION = "luna/robot/emotion"
 TOPIC_FACE_SEEN = "elio/face/seen"  # payload: display name of the recognised person
@@ -382,6 +388,12 @@ listen_state = ListenState.IDLE
 bleed_remaining = 0
 state_lock = threading.Lock()
 
+# "Stop listening" toggle, set via TOPIC_LISTEN_MUTE from the web dashboard.
+# While True, wake-word ("Elio") triggers on TOPIC_WAKE are ignored outright —
+# this only gates new commands and has no effect on narration/TTS (that's
+# handled separately by TOPIC_STOP / stop_narration()).
+voice_input_muted: bool = False
+
 packet_queue: collections.deque = collections.deque()
 vad_queue: collections.deque = collections.deque()
 llm_queue: queue.Queue = queue.Queue()
@@ -449,6 +461,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties) -> None:
         client.subscribe(TOPIC_WAKE)
         client.subscribe(TOPIC_FACE_SEEN)
         client.subscribe(TOPIC_STOP)
+        client.subscribe(TOPIC_LISTEN_MUTE)
         if _system_ready:
             # Re-publish so an ESP32 that restarted while we were up gets the signal
             client.publish(TOPIC_SYSTEM_READY, "1", retain=True)
@@ -520,7 +533,21 @@ def on_mqtt_message(client, userdata, msg) -> None:
     """MQTT callback — fires when a message arrives on any subscribed topic.
     Replaces control_listener(). Handles elio/wake and elio/face/seen.
     """
-    global listen_state, bleed_remaining, _last_wake_time
+    global listen_state, bleed_remaining, _last_wake_time, voice_input_muted
+
+    if msg.topic == TOPIC_LISTEN_MUTE:
+        try:
+            payload = msg.payload.decode("utf-8").strip()
+        except Exception:
+            return
+        voice_input_muted = payload == "1"
+        print(
+            f"\n{ts()} [MUTE] Voice input "
+            f"{'muted — ignoring wake word' if voice_input_muted else 'unmuted — wake word active again'} "
+            "(web dashboard toggle).",
+            flush=True,
+        )
+        return
 
     if msg.topic == TOPIC_FACE_SEEN:
         if RECORDING_MODE:
@@ -541,6 +568,13 @@ def on_mqtt_message(client, userdata, msg) -> None:
         return
 
     if RECORDING_MODE:
+        return
+
+    if voice_input_muted:
+        print(
+            f"{ts()} [WAKE] Wake word received but listening is muted — ignoring.",
+            flush=True,
+        )
         return
 
     now = time.monotonic()
