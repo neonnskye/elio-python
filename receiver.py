@@ -78,7 +78,7 @@ AUDIO_SEND_RATE = 16000  # Hz
 AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pacing
 
 # Groq STT config
-GROQ_MODEL = "whisper-large-v3"
+GROQ_MODEL = "whisper-large-v3-turbo"
 
 # TTS config (Piper local)
 PIPER_MODEL_PATH = os.path.join(
